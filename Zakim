@@ -1,0 +1,5421 @@
+#!/usr/bin/perl -w
+#
+# IRC bridge daemon
+#
+#
+# Copyright (c) 2001,2002 Ralph Swick, Massachusetts Institute of Technology
+# incorporates code and structure from IRC logger by Dave Beckett.
+#
+# IRC logger framework from Dave Beckett is
+# (C) Copyright 2000-2001 Dave Beckett, ILRT, University of Bristol
+# http://purl.org/net/dajobe/
+#
+#   This program is free software; you can redistribute it and/or
+#   modify it under the terms of the GNU General Public License
+#   as published by the Free Software Foundation; either version 2
+#   of the License, or (at your option) any later version.
+#   
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#   
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software
+#   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+# 
+# See http://www.gnu.org/copyleft/gpl.html
+#
+# For documentation run perldoc on this file 'perldoc Zakim'
+#
+
+use Carp;
+use POSIX qw(strftime);
+
+use strict;
+
+# Standard Perl modules
+use File::Path;
+use File::Basename;
+use Getopt::Long;
+use IO::Handle;
+use Time::Local;
+
+# From CPAN
+use URI;
+use Net::IRC;
+use Socket;
+
+%ENV=();
+$ENV{PATH}='/bin:/usr/bin:/usr/local/bin';
+
+my $STX = v2;
+my $ETX = v3;
+
+
+my %channelConfDescription;	# persistent channel descriptions
+				# -> {confDescription}
+my $channelConfDescriptionFile;
+my $lastChannelConfDescriptionModTime = 0;
+
+my $LoggerBot = "RRSAgent";
+
+my $channelMeetingDataFile = "MeetingData";
+my $lastChannelMeetingDataModTime = 0;
+
+my %channelMeetingData;		# Meeting configuration data
+				# -> {logACL}
+				# -> {minutesStyle}
+				# -> {meetingName}
+				# -> {loggerRequests} @ARRAY
+
+my %Conference;			# {confID}->
+				# {conf} {active} {partyCount} {maxParties}
+				# {startTimeStr} {finishTimeStr} {startTime}
+				# {Attendees}->@
+				# {partyCountSerial}
+				# {adhocCode}
+my $SetCallerName = 1;
+my %partyName;			# {id}->{party}
+
+				# Nicks have:
+				# {party} -> Party
+				#   @@ assumes at most 1 telecon per person
+
+				# parties have:
+				# {NameIsUnknown} {NameIsUnsure}
+				# {ArrivalTime} {IRC_user} {Holds}
+
+				# confs have:
+				# {IRCChannel}
+				# {HasTransientParties}
+
+				# channels have:
+				# {BridgeConference} {ConferenceName}
+				# {SpeakerQueue} {SpeakerNotes} {Agenda}->@
+				# {AgendaOrder} {CurrentAgendum}
+				# {CurrentAgendumStarted}
+				# {IgnoreAgenda} {IgnoreQueue}
+				# {QueueIsClosed}
+				# {MsgTime}
+				# {FinalReminder}
+				# {SpeakerTalkTime} {TalkTimerVersion}
+				# {LastAckdSpeaker}
+				# {NamesRequested}
+				# {NicksPresent}
+				# {ConfDescription}
+				# {Attendees}
+				# {Present}
+				# {Questions} {QuestionSyntaxReminder}
+
+				# Agendae have:
+				# {Topic} {Submitter} {Via} {Closed} {Dropped}
+				# {Skipped}
+
+				# Questions have:
+				# {Topic} {Supporters} {Dropped}
+
+my $IRCtrace = 0;		# turn on IRC debug mode
+
+my $confURI = undef;
+my $AgendaFile;
+my $AdminChannel;		# channel for administrative messages
+
+my $Credentials_filepath = "creds.irc";
+
+my $ReaperInterval = 1800;	# seconds between checks for idle channels
+my $ReaperThreshold = 7200;	# seconds since last 'interesting' message
+				#   after which bot resigns from channel
+my $ReaperScheduled = 0;	# reap idle channels semaphore
+
+my $WhoisLog = undef;		# name for WHOIS logfile; not kept by default
+
+my $FileNamePattern = '%Y/%m/%d-<channel>-<type>'; # pattern for generating
+				# channel-unique URIs
+my $LocalRoot = undef;		# local filesystem root for Web space
+my $URIRoot = undef;		# URI root for Web space
+my $TestMode = undef;		# true to display system() commands,
+				# false to evaluate
+
+# Global constants
+
+my $SOLITARY_WAIT_TIME = 300;	# Time in seconds after a conference ends
+				# before we disconnect a lone participant
+
+$::program=basename $0;
+
+$::Nick='bridge'; # OK this can be changed if clashes
+$::IRC_Name='Bridge daemon';
+
+$::LogActionMsgs=1;
+$::LogUserHosts=0;
+$::OffTopic=1;        # [off] at start of line is not logged
+
+@::LogTypes=qw(rdf html txt);
+@::DefaultLogTypes=qw(rdf txt);
+
+# Global variables
+
+# IRC object
+$::IRC=undef;
+
+# root dir of logs
+$::Log_Root='';
+
+# place on the web this corresponds to
+$::Log_URI='';
+
+# System password
+$::Password='';
+
+# True if leaving (so don't reconnect)
+$::Departing=0;
+
+# True if connecting (don't log server notices)
+$::Connecting=0;
+
+# Administrative messages log
+$::Admin_LOG=undef;
+
+# Process ID
+$::PID_File=undef;
+
+$::StatisticsEnabled = 0;	# hold statistics for irc display
+
+my $hidden_conf_codes;
+
+my $Enable_AutoBreakdown = 1;
+
+my $Enable_TerminationWarnings = 1; # Monitor schedule and notify conferences
+				# when their reserved time is coming to and
+				# end and some ports must be freed
+
+######################################################################
+package URI::irc;
+
+# http://www.w3.org/Addressing/draft-mirashi-url-irc-01.txt
+# irc:[ //[ <host>[:<port>] ]/[<target>] [,needpass] ]
+
+require URI::_server;
+
+@URI::irc::ISA=qw(URI::_server);
+
+sub channel ($) {
+  my $path=shift->path;
+  if($path && $path =~ m%^/([^/]+)%) {
+    return $1;
+  }
+  undef;
+}
+
+package main;
+
+######################################################################
+package IRCuser;
+
+# Tracks known IRC users by nick, associating each with the
+# username/hostname information collected via WHOIS.
+
+use Socket;
+
+my %Users;
+
+sub new
+{
+    my ($proto, $nick, $username, $userhost, $fullname) = @_;
+
+    my $class = ref($proto) || $proto;
+
+    my $hostname = undef;
+
+    if ($userhost && (my $hostaddr = inet_aton($userhost))) {
+	$hostname = gethostbyaddr(inet_aton($userhost), AF_INET);
+    }
+
+    my $self  = {
+	'Fullname'	=> $fullname,
+	'Hostaddr'	=> $userhost,
+	'Hostname'	=> $hostname,
+	'Nick'		=> $nick,
+	'Username'	=> $username,
+    };
+
+    bless ($self, $class);
+
+    $Users{$nick} = $self;
+
+    return $self;
+}
+
+# Return a formatted name@addr
+sub address
+{
+    my ($self) = @_;
+    my $username = $self->{Username} || '';
+    my $hostname = $self->{Hostname} || $self->{Hostaddr} || '';
+
+    return $username.'@'.$hostname;
+}
+
+sub fullname
+{
+    my ($self, $new) = @_;
+    $self->{Fullname} = $new if defined $new;
+    return $self->{Fullname};
+}
+
+sub hostaddr
+{
+    my ($self, $new) = @_;
+    my $old = $self->{Hostaddr} || '';
+
+    if ((defined $new) && ($new ne $old)) {
+	if ($new && (my $hostaddr = inet_aton($new))) {
+	    $self->{Hostname} = gethostbyaddr(inet_aton($new), AF_INET);
+	}
+	$self->{Hostaddr} = $new;
+    }
+
+    return $self->{Hostaddr};
+}
+
+sub hostname
+{
+    my ($self, $new) = @_;
+    $self->{Hostname} = $new if defined $new;
+    return $self->{Hostname};
+}
+
+sub nick
+{
+    my ($self, $new) = @_;
+    my $old = $self->{Nick};
+    if (defined $new) {
+	delete $Users{$old};
+	$self->{Nick} = $new;
+	$Users{$new} = $self;
+    }
+    return $self->{Nick};
+}
+
+sub username
+{
+    my ($self, $new) = @_;
+    $self->{Username} = $new if defined $new;
+    return $self->{Username};
+}
+
+sub find
+{
+    my ($searchnick) = @_;
+    my $user = $Users{$searchnick};
+
+    unless ($user) {
+	$searchnick = lc($searchnick);
+	for my $nick (keys %Users) {
+	    if (lc($Users{$nick}->{Nick}) eq $searchnick) {
+		$user = $Users{$nick};
+		last;
+	    }
+	}
+    }
+
+    return $user;
+}
+
+package main;
+
+######################################################################
+
+
+
+sub removeConfFromChannel
+{
+    my ($conf) = @_;
+    my $channel = $conf->{IRCChannel};
+    if ($channel) {
+	delete $conf->{IRCChannel};
+	delete $channel->{BridgeConference};
+    }
+}
+
+sub addConfToChannel($$;$)
+{
+    my ($conf, $channel, $who) = @_;
+    $channel->{BridgeConference} = $conf;
+    $channel->{ConferenceName} = $conf->name;
+    if (defined $conf->{IRCChannel}) {
+	my $oldchannel = $conf->{IRCChannel};
+	if ($oldchannel && $oldchannel->{Listening}) {
+	    my $channel_name = $oldchannel->{NAME};
+	    Say( $oldchannel->{CONN}, $channel_name, $conf->name.' has been moved to '.$channel->{NAME}.($who ? ' by '.$who : '') );
+	}
+	delete $oldchannel->{BridgeConference};
+	delete $oldchannel->{ConferenceName};
+    }
+    $conf->{IRCChannel} = $channel;
+    print $conf, ' (', $conf->name(), ') has irc channel ', $channel, ' (', $channel->{NAME}, ")\n";
+}
+
+
+sub main {
+  my $usage=<<"EOT";
+Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
+  where option is one or more of:
+   -agenda <file>   updates <file> with the list of meeting agendas
+   -[no]autobreakdown  [don't] toss callers off when reserved time has elapsed
+   -bridge <host:port> identify CAS server
+   -nocallername    disables renaming of parties in bridge
+   -confDescriptions <file> conference descriptions by channel
+   -confURI <URI>   URI to which to append conference schedule IDs
+   -html            write an XHTML log
+   -loggerBot <nick>	irc nick of logger bot (default RRSAgent)
+   -meetingData <file>	name of configuration file for Start/End Meeting
+   -notext	    Do not write a text log
+   -trace	    enable debugging output
+   -log <logfile>   Write logs to logfile rather than the default
+                    of channel/YYYY-MM-DD
+                    (\".txt\", \".html\", and \".rdf\" will be appended)
+   -nick <nick>     set the nick
+
+   -noaction	    Do not log /me messages
+   -noofftopic      Do not ignore lines starting with [off]
+   -userhosts       Record user\@host in /join messages
+
+  and channel-URI is like irc://host[:port]/channel
+EOT
+
+  STDOUT->autoflush(1);
+
+  my(%do_log_types)=map {$_ => 1} @::DefaultLogTypes;
+
+  my $log_name=undef;
+  my $bridge = "";
+  die $usage unless GetOptions ('action!' => \$::LogActionMsgs,
+		       'agenda=s'=> \$AgendaFile,
+		       'autobreakdown!' => \$Enable_AutoBreakdown,
+		       'bridge=s'=> \$bridge,
+		       'callername!' => \$SetCallerName,
+		       'confDescriptions=s' => \$channelConfDescriptionFile,
+		       'confURI=s'   => \$confURI,
+		       'fpattern=s'  => \$FileNamePattern,
+		       'hide=s'	 => \$hidden_conf_codes,
+		       'html!'	 => \$do_log_types{'html'},
+		       'irctrace!'  => \$IRCtrace,
+		       'loggerBot=s'  => \$LoggerBot,
+		       'lroot=s' => \$LocalRoot,
+		       'meetingData=s' => \$channelMeetingDataFile,
+		       'system!' => \$TestMode,
+		       'terminationwarnings!' => \$Enable_TerminationWarnings,
+		       'text!'	 => \$do_log_types{'txt'},
+		       'log=s'	 => \$log_name,
+		       'nick=s'	 => \$::Nick,
+		       'uroot=s' => \$URIRoot,
+		       'userhost!' => \$::LogUserHosts,
+		       'whoislog=s'=> \$WhoisLog,
+		       'offtopic!' => \$::OffTopic,
+		      ) && @ARGV==5;
+
+  @::DefaultLogTypes=grep($do_log_types{$_}, @::LogTypes);
+
+  my($password,$uri_string,$channel_title, $log_root, $log_uri_string)=@ARGV;
+
+  my $uri;
+  eval '$uri=new URI $uri_string';
+  die "$::program: '$uri_string' does not look like an IRC URI\n" 
+    if ($@ || !$uri);
+
+
+  die "$::program: log dir $log_root does not exist\n" unless -d $log_root;
+
+  # Set globals
+  $::Password=$password;
+  $::Log_Root=$log_root;
+  $::Log_URI=$log_uri_string;
+  $::Departing=0;
+  $::Connecting=1;
+
+  # Open the administrative log file
+  my $admin_log_file=$::Log_Root.'/'.$::Nick.'.log';
+
+  $::Admin_LOG=new IO::File;
+  $::Admin_LOG->open(">>$admin_log_file") 
+    or die "$::program Failed to append to admin log file $admin_log_file - $!\n";
+  $::Admin_LOG->autoflush(1);
+
+  umask 022;
+
+  # FIXME - pid_file should not have channel in it, when logger
+  # handles multiple channels
+  my $channel_name=$uri->channel;
+  $::PID_File=$::Log_Root.'/'.$::Nick.'-'.$channel_name.'.pid';
+  open(PID,">$::PID_File");
+  print PID "$$\n";
+  close(PID);
+
+  $::IRC = new Net::IRC;
+
+  my $channel=&Channel_new($uri, $channel_title, $log_name);
+
+  $AdminChannel = $channel;
+
+  Channel_join($channel);
+
+  # Never returns
+  $::IRC->start;
+}
+
+# MAIN CODE
+&main;
+
+exit(0);
+
+
+######################################################################
+# Methods on 'logger Channel' object
+# package Logger::Channel;
+
+@::Channels=();			# [] -> {CONN}, {NAME}, {URI}, {Topic},
+				#  {Listening}
+				#  {BridgeConference}, {ConferenceName},
+				#  {SpeakerQueue}, {SpeakerNotes}, {Agenda}
+				#  {IgnoreAgenda}, {IgnoreQueue}
+
+sub Channel_new ($$$) {
+  my($uri,$title,$log_name)=@_;
+
+  my $self={};
+
+  # Channel title
+  $self->{Title}=$title;
+
+  # irc:: URI
+  $self->{URI}=$uri;
+
+  # a file prefix to log to (i.e. write log_name.rdf etc.) or undef
+  # to use default schema
+  $self->{LogName}=$log_name;
+
+  # topic of channel
+  $self->{Topic}='';
+
+  # Last ID seen
+  $self->{Last_ID}='';
+
+  # True if logging
+  $self->{Listening}=0;
+
+  # Track midnight rollover
+  $self->{hour}= undef;
+
+  # NET::IRC connection object
+  $self->{CONN}=undef;
+
+  $self->{LogTypes}=[@::DefaultLogTypes];
+  for my $type (@{$self->{LogTypes}}) {
+    $self->{FH}->{$type}=undef;
+  }
+
+  push(@::Channels, $self);
+
+  $self;
+}
+
+
+sub Channel_join($) {
+  my($self)=@_;
+
+  my $uri=$self->{URI};
+
+  my $channel_name=$uri->channel;
+
+  $self->{Listening}=1;
+
+  my $irchost = $uri->host;
+  my $ircport = $uri->port;
+  my $user_name=$channel_name.'-bridge';
+  my $ircpwd=undef;
+  my $ssl=0;
+
+  {
+    open CRED, "< $Credentials_filepath"
+	or do {
+	    warn "no IRC credentials found\n";
+	    last;
+        };
+    while (<CRED>) {
+	chomp;
+	s/#.*$//;		# trim comments
+	next if length == 0;
+	(my $host, my $port, my $user, my $pwd, my $dossl) = split(':');
+	if ($host eq $irchost) {
+	    $irchost = $host;
+	    $ircport = $port;
+	    $user_name = $user;
+	    $ircpwd = $pwd;
+	    $ssl = $dossl;
+	    last;
+	}
+    }
+    close CRED;
+  }
+
+  my $conn = $::IRC->newconn(Nick    => $::Nick,
+			     Server  => $irchost,
+			     Port    => $ircport,
+			     Ircname => $::IRC_Name,
+			     Username => $user_name,
+			     Password => $ircpwd,
+			     SSL      => $ssl,
+      );
+
+  die "$::program: Cannot create connection to $uri\n" 
+    unless $conn;
+
+  $self->{CONN}=$conn;
+  
+  Channel_open_logs($self);
+
+  $conn->debug(1) if $IRCtrace;
+
+  # Install handlers
+  # On 'end of MOTD' event, join ilrt channel
+  $conn->add_global_handler(376, \&on_connect);
+  $conn->add_global_handler(353, \&on_names);
+  $conn->add_global_handler('disconnect', \&on_disconnect);
+
+  $conn->add_handler('msg', \&on_msg);
+  $conn->add_handler('public', \&on_public);
+  $conn->add_handler('part', \&on_part);
+  $conn->add_handler('join', \&on_join);
+  $conn->add_handler('kick', \&on_kick);
+  $conn->add_handler('caction', \&on_caction);
+  $conn->add_handler('quit', \&on_quit);
+  $conn->add_handler('nick', \&on_nick);
+  $conn->add_handler('nicknameinuse', \&on_nicknameinuse);
+  $conn->add_handler('topic', \&on_topic);
+  $conn->add_handler('notice', \&on_notice);
+  $conn->add_handler('invite', \&on_invite);
+  $conn->add_handler('whoisuser', \&on_whoisuser);
+
+  # turn off CTCP ACTION warnings from Net::IRC::Connection.pm
+  BEGIN { $SIG{'__WARN__'} = sub { warn $_[0] if not $_[0] =~ m/^ONE:/ } }
+
+}
+
+sub Channel_by_conn($) {
+  my $conn=shift;
+  for my $channel (@::Channels) {
+    return $channel if $channel->{CONN} == $conn;
+  }
+  return undef;
+}
+
+sub Channel_by_name($) {
+  my $name=shift;
+  for my $channel (@::Channels) {
+    return $channel if $channel->{NAME} =~ m/^\Q$name\E$/i;
+  }
+  return undef;
+}
+
+sub Channel_by_nick($) {
+    my ($nick) = @_;
+    my $ircUser = IRCuser::find($nick);
+    my $party = $ircUser ? $ircUser->{party} : undef;
+    if ($party && $party->conf) {
+	return $party->conf->{IRCChannel};
+    }
+    return undef;
+}
+
+
+######################################################################
+# Logging - methods on Net::IRC::Connection object
+
+sub log_admin_event ($$$;$) {
+  my($self, $event, $t, $msg)=@_;
+  my $nick=$event ? $event->nick : '';
+
+  my @tm = gmtime($t);
+  $tm[5]+= 1900; $tm[4]++;
+  my $date = sprintf("%04d-%02d-%02d", $tm[5], $tm[4], $tm[3]);
+  my $time = sprintf("%02d:%02d:%02d", $tm[2], $tm[1], $tm[0]);
+
+  my $txt_msg=$nick ? qq{<$nick> $msg} : $msg;
+  if($::Admin_LOG) {
+    print $::Admin_LOG "${date}T${time}Z $txt_msg\n";
+  } else {
+    warn "${date}T${time}Z $txt_msg\n";
+  }
+}
+
+
+######################################################################
+# Global events
+
+# What to do when logger successfully connects.
+sub on_connect {
+  my ($self, $event) = @_;
+  
+  my $channel=Channel_by_conn($self);
+
+  my $channel_name;
+
+  if ($channel->{URI}->channel =~ m/[\#&]/) {
+      $channel_name = $channel->{URI}->channel; # don't add a prefix if one was given
+  } else {
+      $channel_name ='#' . $channel->{URI}->channel; # else assume a public channel
+  }
+
+  $channel->{NAME} = $channel_name;
+
+  log_admin_event($self, $event, time, $::Nick.' connected to server');
+
+  $self->join($channel_name);
+  $channel->{Listening}=1;
+#  $self->me($channel_name, 'is logging');
+}
+
+
+# What to do when logger's nick is already used
+sub on_nicknameinuse {
+  my ($self, $event) = @_;
+  
+  if ($::Nick !~ /_/) {
+    $::Nick.="_1";
+  } else {
+    $::Nick++; # magical increment
+  }
+  $self->nick($::Nick);
+}
+
+
+# Prints the names of people in a channel on join and in response to NAMES
+sub on_names {
+  my ($self, $event) = @_;
+  my ($nick, $equals, $channel_name, $list) = $event->args;
+  
+  $::Connecting=0;
+
+  unless ($nick eq $self->nick && $equals eq '=') {
+      print "on_names: received nick=$nick$equals\n";
+      return;
+  }
+
+  $list =~ s/ @/ /g;
+  $list =~ s/^@//;
+  $list =~ s/\s*$//;
+  $list =~ s/^\Q$nick\E\s*//i;
+
+  print( "present: $list\n" );
+
+  my $channel = Channel_by_name($channel_name);
+
+  for my $nick (split(' ', $list)) {
+      WhoIs( $self, $nick );
+      my $ircUser = IRCuser::find($nick) || new IRCuser( $nick );
+      push( @{$channel->{NicksPresent}}, $ircUser );
+  }
+
+  return unless defined $channel->{NamesRequested};
+
+  my $dest_nick = $channel_name;
+
+  $list =~ s/ /, /g;
+
+  my $first_person = $channel->{NamesRequested};
+
+  Say( $self,
+       $dest_nick,
+       ($first_person ? 'On IRC I see ' : 'sees on irc: ').$list,
+       $first_person );
+  delete $channel->{NamesRequested};
+}
+
+
+# Reconnect to the server when we die.
+sub on_disconnect {
+  my ($self, $event) = @_;
+  
+  my $t=time;
+  my $m="Disconnected from ". $event->from(). " (". ($event->args())[0]. ")";
+  log_admin_event($self, $event, $t, $m);
+  log_pending_output($self);
+
+  return if $::Departing;
+
+  log_admin_event($self, $event, time, "Attempting to reconnect");
+  unlink $::PID_File;
+  print $m, "\n";
+  exit(0);
+}
+
+
+######################################################################
+# Per connection events
+
+
+# When received a private message
+sub on_msg {
+  my($self,$event)=@_;
+  my $nick = $event->nick;
+  my $channel_name = $event->to;
+
+  return if $nick eq $::Nick;
+
+  my $arg = join(' ', $event->args);
+  command_for_me($self, $event, $channel_name, $arg, 1, 1);
+}
+
+
+# What to do when we receive channel text.
+sub on_public {
+  my ($self, $event) = @_;
+  my @to = $event->to;
+  my ($nick, $mynick) = ($event->nick, $self->nick);
+  my $arg = join(' ', $event->args);
+
+  if ($arg =~ /^\s*$mynick,\s*(.*)$/i) {
+    command_for_me($self, $event, $to[0], $1, 0, 1);
+  }
+  else {
+    watch_significant_events($self, $event, $to[0], $arg, 0, 0);
+  }
+
+  if (!$ReaperScheduled) {
+      $self->schedule( $ReaperInterval, \&ReapIdleChannels, $self );
+      $ReaperScheduled = 1;
+  }
+}
+
+
+# What to do when we receive /me (and other stuff??)
+sub on_caction {
+  my ($self, $event) = @_;
+  my $nick = $event->nick;
+  my $mynick = $self->nick;
+  my $arg = join(' ', $event->args);
+
+  if ($arg =~ /^\s*$mynick,\s*(.*)$/i) {
+    command_for_me($self, $event, @{$event->to}[0], $1, 0, 0);
+  }
+  else {
+    watch_significant_events($self, $event, @{$event->to}[0], $arg, 0, 0);
+  }
+  return;
+}
+
+
+# What to do when someone leaves a channel we're monitoring
+sub on_part {
+  my ($self, $event) = @_;
+  my ($channel_name) = ($event->to)[0];
+  my $nick=$event->nick;
+
+  return if $nick eq $::Nick;
+
+  my $channel = Channel_by_name($channel_name);
+
+  if ($channel) {
+      if (my $ircUser = IRCuser::find($nick)) {
+	  my $position = FindInArray( $channel->{NicksPresent}, $ircUser, 1 );
+	  splice( @{$channel->{NicksPresent}}, $position, 1 ) if defined $position;
+      }
+  }
+}
+
+
+# We've been invited to a channel
+sub on_invite {
+  my ($self, $event) = @_;
+  my $nick = $event->nick;
+  my $arg = join('~', $event->args);
+
+  my @args = $event->args;
+  my $channel_name = $args[0];
+  print "Invited to '$channel_name'\n";
+
+  $self->join($channel_name);
+}
+
+# What to do when we receive channel notice (mostly other bots)
+sub on_notice {
+  my ($self, $event) = @_;
+  my $nick = $event->nick;
+  my $arg = join(' ', $event->args);
+}
+
+
+
+# What to do when someone leaves a channel logger is on.
+sub on_quit {
+  my ($self, $event) = @_;
+  my $nick=$event->nick;
+}
+
+
+# What to do when someone is kicked on a channel logger is on.
+sub on_kick {
+  my ($self, $event) = @_;
+  my $nick=$event->nick;
+  my $whom = ($event->to)[0];
+  my $channel_name = ($event->args)[0];
+
+  my $msg="$nick has kicked $whom from $channel_name";
+  log_admin_event($self, $event, time, $msg);
+
+  my $channel = Channel_by_name($channel_name);
+
+  unless ($whom eq $::Nick) { # wasn't me who was kicked
+      if ($channel) {
+	  if (my $ircUser = IRCuser::find($whom)) {
+	      my $position = FindInArray( $channel->{NicksPresent}, $ircUser, 1 );
+	      splice( @{$channel->{NicksPresent}}, $position, 1 ) if defined $position;
+	  }
+      }
+      return;
+  }
+
+  # I was kicked
+  if (defined $channel) {
+      my $conf = $channel->{BridgeConference};
+      removeConfFromChannel($conf) if $conf;
+      $channel->{Listening} = 0;
+
+      for (my $index=0; $index <= $#::Channels; $index++) {
+	  if ($::Channels[$index] == $channel) {
+	      print "Excused from '$channel_name'\n";
+	      splice(@::Channels, $index, 1);
+	      last;
+	  }
+      }
+  }
+  else {
+      my $msg = "Unknown channel from $nick on $channel_name";
+      log_admin_event($self, $event, time, $msg);
+      print $msg, "\n";
+  }
+}
+
+
+# What to do when someone does /nick
+sub on_nick {
+  my ($self, $event) = @_;
+  my $oldnick = $event->nick;
+  my ($newnick) = $event->args;
+
+  my $ircUser = IRCuser::find($oldnick);
+
+  my $address = '';
+
+  if ($ircUser) {
+      $ircUser->nick($newnick);
+      $address = $ircUser->address;
+      my ($party, $conf);
+      if (($party = $ircUser->{party}) && ($conf = $party->conf)) {
+	  my $channel = $conf->{IRCChannel};
+	  my $currentQueue = $channel->{SpeakerQueue};
+	  my $position = FindInArray( $currentQueue, $oldnick, 1 );
+	  if (defined $position) {
+	      @{$currentQueue}[$position] = $newnick;
+	      $channel->{SpeakerQueue} = $currentQueue;
+	  }
+      }
+      if ($WhoisLog) {
+	  if (open (WHOIS, ">> $WhoisLog")) {
+	      print WHOIS Timestamp(), ' ', $ircUser->address, "\t",
+			  $newnick, "\t(", $ircUser->fullname, ")\n";
+	      close WHOIS;
+	  }
+	  else {
+	      warn "Can't open WHOIS log $WhoisLog\n";
+	  }
+      }
+  }
+
+  print $oldnick, ' is now ', $newnick, ' (', $address, ")\n";
+}
+
+
+# What to do when someone does /topic MSG
+sub on_topic {
+  my ($self, $event) = @_;
+  my $channel=Channel_by_conn($self);
+
+  my $nick=$event->nick;
+  my(@args)=$event->args;
+  my $arg;
+  if(@args == 3) {
+    $arg=$args[2];
+  } else {
+    $arg=$args[0];
+  }
+  $channel->{Topic}=$arg;
+}
+
+
+# What to do when someone joins a channel the bot is on.
+sub on_join {
+  my ($self, $event) = @_;
+
+  my ($channel_name) = ($event->to)[0];
+  my $user_nick=$event->nick;
+
+  my $format=$::LogUserHosts ? "%s (%s) has joined $channel_name" :
+                               "%s has joined $channel_name";
+  my $t=time;
+  my $m=sprintf($format, $user_nick, $event->userhost);
+
+  my $channel = Channel_by_name($channel_name);
+  if (!$channel) {
+      print "on_join: new Channel '$channel_name'\n";
+      $channel = &Channel_new();
+      $channel->{NAME} = $channel_name;
+      $channel->{CONN} = $self;
+      $channel->{MsgTime} = time;
+      $channel->{NicksPresent} = [];
+  }
+
+  $channel->{Listening}=1;
+
+  if($user_nick eq $::Nick) {
+    log_admin_event($self, $event, $t, $m);
+    $channel->{MsgTime} = time;
+  } else {
+    my $ircUser = IRCuser::find($user_nick) || new IRCuser( $user_nick );
+    WhoIs($self, $user_nick)
+	unless $ircUser->username
+	    && $ircUser->username eq $event->user
+	    && $ircUser->hostaddr eq $event->host;
+    push( @{$channel->{NicksPresent}}, $ircUser );
+  }
+
+  print "$m\n";
+}
+
+
+# Response to WHOIS
+sub on_whoisuser
+{
+  my ($self, $event) = @_;
+  my $channel=Channel_by_conn($self);
+
+  my ($nick, $usernick, $username, $userhost, undef, $fullname) = $event->args;
+
+  my $ircUser = IRCuser::find($usernick);
+
+  my $changed = undef;
+
+  if ($ircUser) {
+      $changed = ($ircUser->username ? $username ne $ircUser->username : 1)
+	      || ($ircUser->hostaddr ? $userhost ne $ircUser->hostaddr : 1)
+	      || ($ircUser->fullname ? $fullname ne $ircUser->fullname : 1);
+      $ircUser->username($username);
+      $ircUser->hostaddr($userhost);
+      $ircUser->fullname($fullname);
+  } else {
+      $ircUser = new IRCuser( $usernick, $username, $userhost, $fullname );
+      $changed = 1;
+  }
+
+  if ($changed && $WhoisLog) {
+      if (open (WHOIS, ">> $WhoisLog")) {
+	  print WHOIS Timestamp(), ' ', $ircUser->address, "\t",
+	  	      $usernick, "\t(", $fullname, ")\n";
+	  close WHOIS;
+      }
+      else {
+	  warn "Can't open WHOIS log $WhoisLog\n";
+      }
+  }
+
+  print "$usernick is ", $ircUser->address, " ($fullname)\n";
+}
+
+sub command_for_me ($$$$$$$) {
+  my($self, $event, $channel_name, $command, $is_private, $first_person, $from_read_process)=@_;
+  my $from_nick=$event->nick;
+  my $channel= $is_private ? Channel_by_nick($from_nick)
+      			   : Channel_by_name($channel_name);
+
+  my $dest_nick=($is_private ? $from_nick :
+		 ($first_person ? $event->to : join('',$event->to)));
+
+  $channel->{MsgTime} = time;
+
+  $command=~s/^\s+//;
+  $command=~s/,?\s+please(\??)$/$1/;
+  $command=~s/[\.\s]*$//;	# trim off any trailing spaces and '.'
+
+  unless (defined $channel ||
+	  $command =~ /^(?:please\s+|pls\s+)?help/i ||
+	  $command =~ /^(?:are\s+you\s+)?(?:busy\s*\?)/i ||
+	  $command =~ /^(?:stats|statistics)/i ||
+	  $command =~ /^(?:please\s+|pls\s+)?(?:quit|finish|terminate|die|exterminate|stop)$/i ) {
+      Say( $self,
+	   $dest_nick,
+	   "I don't know what conference you are in"
+	     .($is_private ? '' : ", $from_nick"),
+	   $first_person
+	  );
+      print "Command from unknown channel; private=$is_private, chan=",
+	    join('',@{$channel_name}),", from=$from_nick\n";
+      return;
+  }
+
+  my $output='';
+
+  my $valid_password=0;
+  if($command =~ s/^password (\S+)\s*//) {
+    if($1 eq $::Password) {
+      $valid_password=1;
+    } else {
+      Say( $self, $dest_nick, "Invalid password", $first_person );
+      return;
+    }
+  }
+
+  if($valid_password) {
+    log_admin_event($self, $event, time, "$from_nick attempted $command");
+
+    if($command eq 'restart') {
+      $::Departing=1;
+      $self->me($event->to, ' is departing');
+      $self->quit;
+      sleep(1);
+      $::Connecting=1;
+      $self->connect();
+      return;
+    }
+  
+    if($command eq 'debug') {
+      $self->privmsg($dest_nick, "Debugging is on");
+      $self->debug(1);
+      return;
+    }
+    
+    if($command eq 'nodebug') {
+      $self->privmsg($dest_nick, "Debugging is off");
+      $self->debug(0);
+      return;
+    }
+
+    # please quit
+    if($command=~ /^(?:please\s+|pls\s+)?(?:quit|finish|terminate|die|exterminate|stop)$/i) {
+      $::Departing=1;
+      for my $channel (@::Channels) {
+	  $self->me($channel->{NAME}, 'is departing');
+      }
+      # Log who told me to quit
+      log_admin_event($self, $event, time, "$::Nick told to quit");
+      $self->quit;
+      unlink $::PID_File;
+      exit(0);
+    }
+
+    # please announce xxxx
+    if($command=~ /^(?:please\s+|pls\s+)?((?:announce|remark|whisper))\s+(.*)$/i) {
+      my $aloud = $1 eq 'announce';
+      my $message = $2;
+      do_announce( $self, $message, $aloud );
+      Say( $self, $dest_nick, 'done', $first_person );
+      return;
+    }
+
+    # clear statistics
+    if($command =~ /^(?:clear\s+stats|clear\s+statistics)$/i) {
+	foreach my $c (keys %Conference) {
+	    print '*** ',__LINE__,' undefined conf ', $c, "\n"	# @@ debugging
+		unless (defined $c->{conf});
+	    delete $Conference{$c} if ! $Conference{$c}->{active};
+	}
+	Say( $self, $dest_nick, "done, $from_nick", $first_person );
+	return;
+    }
+
+    # disable statistics
+    if($command =~ /^(?:disable\s+stats|disable\s+statistics)$/i) {
+	foreach my $c (keys %Conference) {
+	    print '*** ',__LINE__,' undefined conf ', $c, "\n"	# @@ debugging
+		unless (defined $c->{conf});
+	    delete $Conference{$c} if ! $Conference{$c}->{active};
+	}
+	$::StatisticsEnabled = 0;
+	Say( $self, $dest_nick, "statistics will not be held, $from_nick", $first_person );
+	return;
+    }
+
+    # enable statistics
+    if($command =~ /^(?:enable\s+stats|enable\s+statistics)$/i) {
+	$::StatisticsEnabled = 1;
+	Say( $self, $dest_nick, "statistics will be held, $from_nick", $first_person );
+	return;
+    }
+
+    # disable autobreakdown
+    if($command =~ /^disable\s+autobreakdown$/i) {
+	my $msg = $Enable_AutoBreakdown ? 'is now' : 'was already';
+	$Enable_AutoBreakdown = 0;
+	Say( $self, $dest_nick, "AutoBreakdown $msg disabled, $from_nick", $first_person );
+	return;
+    }
+
+    # enable autobreakdown
+    if($command =~ /^enable\s+autobreakdown$/i) {
+	my $msg = $Enable_AutoBreakdown ? 'was already' : 'is now';
+	$Enable_AutoBreakdown = 1;
+	Say( $self, $dest_nick, "AutoBreakdown $msg enabled, $from_nick", $first_person );
+	return;
+    }
+
+    # disable termination warnings
+    if($command =~ /^disable\s+termination(\s+warnings)?$/i) {
+	my $msg = $Enable_TerminationWarnings ? 'are now' : 'were already';
+	$Enable_TerminationWarnings = 0;
+	Say( $self, $dest_nick, "Termination warnings $msg disabled, $from_nick", $first_person );
+	return;
+    }
+
+    # enable termination warnings
+    if($command =~ /^enable\s+termination(\s+warnings)?$/i) {
+	my $msg = $Enable_TerminationWarnings ? 'were already' : 'are now';
+	$Enable_TerminationWarnings = 1;
+	Say( $self, $dest_nick, "Termination warnings $msg enabled, $from_nick", $first_person );
+	return;
+    }
+
+    # set leapday
+    if($command =~ /^set\s+leap(day)?$/i) {
+	my $msg = $::LeapDayFix ? 'was already' : 'is now';
+	$::LeapDayFix = 1;
+	Say( $self, $dest_nick, "Leap Day $msg in effect, $from_nick", $first_person );
+	return;
+    }
+
+    # clear leapday
+    if($command =~ /^clear\s+leap(day)?$/i) {
+	my $msg = $::LeapDayFix ? 'is no longer' : 'was not';
+	$::LeapDayFix = 0;
+	Say( $self, $dest_nick, "Leap Day $msg in effect, $from_nick", $first_person );
+	return;
+    }
+
+  }
+
+  # please excuse us
+  if($command=~ /^(?:please\s+|pls\s+)?(?:bye|part|excuse\s+us|leave|goodbye)$/i ||
+     ($valid_password && $command=~ /^part\s+(\S+)$/i)) {
+    if($command=~ /^part\s+(\S+)$/i) {
+	$channel_name = $1;
+	$channel = Channel_by_name($channel_name);
+	unless ($channel) {
+	    Say( $self, $dest_nick, "I don't recognize channel $channel_name" );
+	    return;
+	}
+	else {
+	    my $confName = $channel->{ConferenceName};
+	    $confName = $confName ? " ($confName)" : '';
+	    Say( $self, $dest_nick, "leaving $channel_name$confName" );
+	}
+    }
+    my $attendees = $channel->{Attendees};
+    Say( $self, $dest_nick, 'leaving.  As of this point the attendees have been '.join(', ', @{$attendees}) ) if $attendees && @{$attendees};
+
+    LeaveChannel($self, $channel, $event, $channel_name);
+    return;
+  }
+
+  # statistics
+  if($command =~ /^(?:stats|statistics)$/i) {
+      my $empty = 1;
+      foreach my $c (keys %Conference) {
+	  $empty = 0;
+	  my $maxP = $Conference{$c}->{maxParties};
+	  my $active = $Conference{$c}->{active};
+	  unless (defined $Conference{$c}->{conf}) {
+	      print '*** ',__LINE__,' undefined conf ', $c, "\n"; # @@ debugging
+	      next;
+	  }
+	  Say( $self,
+	       $dest_nick,
+	       $Conference{$c}->{conf}->name().($active? ' using ' : ' used ').$maxP." port".($maxP == 1 ? '' : 's').($active ? '' : " [ended on $Conference{$c}->{finishTimeStr}]"),
+	       $first_person );
+      }
+      if ($empty) {
+	  Say( $self, $dest_nick, "Sorry, $from_nick, no statistics yet", $first_person );
+      }
+      else {
+	  Say( $self, $dest_nick, "that's all, $from_nick", $first_person );
+      }
+      return;
+  }
+
+  # is xxx here?
+  # is xxx on the call?
+  # have you seen xxx?
+  if($command =~ /^is\s+(\S+)\s+(?:here|on\s+the\s+call)\s*\?$/i ||
+     $command =~ /^(?:have\s+you\s+|)seen\s+(\S+)\s*\?$/i) {
+      my $query = $1;
+      my $partySeen = '';
+      my $sep = '';
+      my $partyElsewhere = '';
+      my $sepElse = '';
+      my $arrived = '';
+      my $count = 0;
+      my $conf = $channel->{BridgeConference};
+      foreach my $party (values %partyName) {
+	  next unless $party->conf;	# @@ lingering party w/o conf
+	  my $name = $party->name();
+	  if ($name =~ m/^\Q$query\E/i) {
+	      if (defined $conf && $party->conf == $conf) {
+		  $count++;
+		  if ($party->{ArrivalTime} && $count < 2) {
+		      my $ago = int( (time - $party->{ArrivalTime}) / 60 );
+		      if ($ago > 0) {
+			  $arrived = $name
+			      .' arrived '
+			      .$ago
+			      .' minute'
+			      .($ago == 1 ? '' : 's')
+			      .' ago';
+		      }
+		      else {
+			  $arrived = $name.' just arrived';
+		      }
+		  }
+		  else { $arrived = '' };
+		  $partySeen .= $sep.$name;
+		  $sep = ', ';
+	      }
+	      else {
+		  $partyElsewhere .= $sepElse.$name.' in another telecon';
+		  $sepElse = ', ';
+	      }
+	  }
+	  else {
+	      if (defined $conf
+		  && $party->conf == $conf
+		  && (my $p = InList($query, $party->{Holds}))) {
+		  $partyElsewhere .= $sepElse.$p.' listed in '.$party->name;
+		  $sepElse = ', ';
+	      }
+	  }
+      }
+      Say( $self,
+	   $dest_nick,
+	   $partySeen ne ''
+		? "probably, $from_nick; "
+		     .($arrived ? $arrived : "I see $partySeen here")
+		: $partyElsewhere eq ''
+		     ? "$from_nick, I do not see ".ucfirst($query).' anywhere'
+		     : "$from_nick, I see $partyElsewhere",
+	   $first_person
+	  );
+      return;
+  }
+
+  # now that 'really' is optional in 'xxx is yyy', this test must come first
+  # who is here?
+  if($command =~ /^(?:who's|who\s+is)\s+(still\s+)?(?:here|on\s+the\s+(?:phone|call))\s*\?$/i) {
+
+      my $present = $channel->{Present};
+      if (! defined $present ||
+	  @{$present} eq 0) {
+	  $present = "(no one)"
+      } else {
+	  $present = join( ', ', @$present );
+      }
+
+      Say( $self,
+	   $dest_nick,
+	   'Present: '.$present,
+	   $first_person );
+
+      unless ($command =~ m/(?:phone|call)\s*\??$/i) { # unless phone only
+	  $channel->{NicksPresent} = []; # prepare to receive several replies
+	  $self->names( $channel_name );
+	  $channel->{NamesRequested} = $first_person;
+      }
+
+      return;
+  }
+
+  # this is xxx
+  # this conference is xxx
+  # now that 'really' is optional in 'xxx is yyy', this test must come first
+  # this conference is xxxx
+  # move xxx to here
+  # move xxx to this channel
+  if($command =~ /^(?:this\s+is|this\s+conference\s+is)\s+(.+)$/i ||
+     $command =~ /^move\s+(\S+)\s+to\s+(?:here|this\s+channel)$/i) {
+    my $searchname = $1;
+
+    $channel->{ConfDescription} = $1;
+
+    Say( $self, $dest_nick, "got it, $from_nick", $first_person );
+    return;
+  }
+
+  # save this conference description
+  if($command=~ /^(?:please\s+|pls\s+|)save\s+(this\s+)?(conference\s+)?description(?:\s+(\S+)|)$/i) {
+      if (not defined $channel->{ConfDescription}) {
+	  Say( $self, $dest_nick, "sorry, I have not been told a conference description for this channel, $from_nick", $first_person );
+	  return;
+      }
+
+      SaveChannelConfDescriptionFile($channel);
+      Say( $self, $dest_nick, "this conference description has been saved, $from_nick", $first_person );
+      return;
+  }
+
+  # This test must be performed prior to the 'xxx has yyy' test
+  # and prior to the 'is yyy' test
+  # xxx has just arrived in yyy
+  # xxx has just entered yyy
+  # I have just arrived in yyy
+  # xxx is in yyy
+  # xxx is with yyy
+
+  if($command =~ /^(\S+)\s+(?:has\s+|have\s+)?(?:just\s+)?(?:arrived\s+in|entered)\s+(\S+)\s*\??$/i ||
+     $command =~ /^(\S+)(?:\s+is|'s)\s+(?:in|with)\s+(\S+)\s*\??$/i ||
+     $command =~ /^(i)(?:\s+am|'m)\s+with\s+(\S+)$/i) {
+      my $individual = $1;
+      my $searchname = $2;
+#     my $ircUser;
+      my $party;
+      my $ambig;
+
+      my $isquery = ($searchname =~ s/\?$// || $command =~ m/\?$/);
+
+      if ($individual eq 'who' && !$isquery) {
+	  Say( $self,
+	       $dest_nick,
+	       "$from_nick, please add '?' if you meant to ask a question",
+	       $first_person
+	      );
+	  return;
+      }
+
+      if ($searchname =~ m/^(?:me|us|i)$/i) {
+	  my $fromUser = IRCuser::find($from_nick);
+	  $party = $fromUser->{party} if $fromUser;
+#	  $ircUser = IRCuser::find($name);
+
+	  if (lc($searchname) eq 'us') {
+	      unless ($party) {
+		  Say( $self,
+		       $dest_nick,
+		       "I do not know where you are, $from_nick",
+		       $first_person );
+		  return;
+	      }
+	      $searchname = $party->name;
+	  } else {
+	      $searchname = $from_nick;
+	  }
+      }
+
+      my $conf = $channel->{BridgeConference};
+      ($party, $ambig) = FindConfParty( $conf, $searchname ) unless $party;
+
+      unless ($party) {
+	  Say( $self,
+	       $dest_nick,
+	       $ambig ? "'$searchname' is ambiguous, $from_nick"
+		      : "sorry, $from_nick, I do not recognize a party named '$searchname'",
+	       $first_person );
+	  return;
+      }
+
+      if ($individual =~ /^(?:me|i)$/i) {
+	  $individual = $from_nick;
+#	  $ircUser = IRCuser::find($individual);
+      }
+
+      # $individual = ucfirst($individual);
+      if ($isquery) {
+	  my $name = $party->name;
+	  $name =~ s/\?$// if defined $party->{NameIsUnsure};
+	  my $holds = $party->{Holds};
+	  if (defined $holds) {
+	      $holds = 'no one' unless $holds;
+	  }
+	  else {
+	      $holds = 'only '.$name;
+	  }
+	  Say( $self, $dest_nick, "$name has $holds", $first_person );
+      }
+      else {
+	  if (my $i = InList($individual, $party->{Holds})) {
+	      Say( $self,
+		   $dest_nick,
+		   $i.' was already listed in '.$party->name.', '.$from_nick,
+		   $first_person );
+	      return;
+	  }
+
+	  if ($command =~ /^(\S+)(?:\s+is|'s)\s+with\s+(\S+)\s*\??$/i) {
+	      # include the original party if this is the first time
+	      my $was = $party->{Holds} || $party->name;
+	      $party->{Holds} = $was.', '.$individual;
+	  } else {
+	      my $sep = $party->{Holds} ? ', ' : '';
+	      $party->{Holds} .= $sep.$individual;
+	  }
+
+	  $conf->{HasTransientParties} = 1;
+	  AddAttendee( $Conference{$conf->id}, $individual );
+#	  $ircUser->{party} = $party if $ircUser;
+	  Say( $self,
+	       $dest_nick,
+	       "+$individual; got it",
+	       $first_person );
+      }
+      return;
+  }
+
+  # All commands of the form 'xxx is ...' that are not renaming a participant
+  # must be tested before this point.
+
+  # xxx is yyy
+  # xxx is perhaps yyy
+  # xxx is probably yyy
+  # xxx is really yyy
+  # xxx is temporarily yyy
+  # xxx may be yyy
+  if(($command =~ /^(\S+)\s+(?:is really|may be|is perhaps|is possibly|is probably|is temporarily|is)\s+(\S+)$/i) && $1 ne 'who' && $1 ne 'what') {
+      my $searchname = $1;
+      my $newname = $2;
+      $newname =~ s/ /_/g;
+      my $nameFlags = '';
+      if ($newname =~ m/^(?:me|i)$/i) { $newname = $from_nick }
+      # $newname = ucfirst($newname);
+      if ($command =~ /\s(?:may be|is perhaps|is possibly|is probably)\s/) {
+	  $newname .= '?';
+	  $nameFlags = 'U';
+      }
+      elsif ($command =~ /\s(?:is temporarily)\s/i) {
+	  $nameFlags = 'T';
+      }
+
+      my $conf = $channel->{BridgeConference};
+      my $party = RenameConfParty( $conf,
+				   $searchname,
+				   $newname,
+				   $nameFlags
+				  );
+      if ($party) {
+	  DropAttendee( $Conference{$conf->id}, $searchname );
+	  AddAttendee( $Conference{$conf->id}, $newname );
+	  $party->{Holds} = undef if $command =~ /^(\S+)\s+is really/;
+          Say( $self, $dest_nick, "+$newname; got it", $first_person );
+      }
+      else {
+	  if ($searchname eq 'where' && $newname =~ m/\+?[-0-9\.]+$/) {
+	      Say( $self, $dest_nick, "$from_nick, I do not see a party named '$searchname'.  If you meant to ask a question you need to add '?'", $first_person );
+	  }
+          elsif (($searchname =~ m/^\?\?P(\d+)$/i)
+		 && (my $party = Party::port2party($1))) {
+	      my $oldname = $party->name;
+	      my $msg = ($first_person ? 'I ' : '')
+		     .'already had ??P'.$1.' as '.$oldname.', '.$from_nick;
+	      if ($command =~ /^(\S+)\s+is really/) {
+		  DropAttendee( $Conference{$conf->id}, $oldname );
+		  $party->name($newname);
+		  AddAttendee( $Conference{$conf->id}, $newname );
+		  $party->{Holds} = undef;
+		  $msg = "+$newname; got it";
+	      }
+	      Say( $self,
+		   $dest_nick,
+		   $msg,
+		   $first_person );
+	  }
+	  else {
+	      Say( $self,
+		   $dest_nick,
+		   ($newname =~ m'\?$')
+		     ? "sorry, $from_nick, I do not understand your question"
+		     : "sorry, $from_nick, I do not recognize a party named '$searchname'",
+		   $first_person );
+	  }
+      }
+      return;
+  }
+
+  # I am xxxx
+  if($command =~ /^I\s+am\s+(\S+)$/i ||
+     $command =~ /^nick\s+(\S+)\s+is\s+(\S+)$/i) {
+      my $searchname;
+      my $ircUser;
+      unless ($2) {
+	  $searchname = $1;
+	  $ircUser = IRCuser::find($from_nick);
+      }
+      else {
+	  my $nick = $1;
+	  $searchname = $2;
+	  $ircUser = IRCuser::find($nick);
+	  unless ($ircUser) {
+	      Say( $self,
+		   $dest_nick,
+		   "sorry, $from_nick, I do not see '$nick' on this channel",
+		   $first_person
+		  );
+	      return;
+	  }
+      }
+
+      my $newname = $from_nick; # ucfirst($from_nick);
+      my $conf = $channel->{BridgeConference};
+      my ($party, $ambig) = FindConfParty( $conf, $searchname );
+      if (!$party) {
+	  Say( $self,
+	       $dest_nick,
+	       "sorry, $from_nick, I do not see a party named '$searchname'",
+	       $first_person
+	      );
+	  return;
+      }
+
+      $party->{IRC_user} = $ircUser;
+      $ircUser->{party} = $party if $ircUser;
+
+      if ($party->{NameIsUnknown}) {
+	  RenameConfParty( $conf, $searchname, $newname, '' );
+	  AddAttendee( $Conference{$conf->id}, $newname );
+	  Say( $self, $dest_nick, "+$newname; got it", $first_person );
+      }
+      else {
+	  my $nick = $ircUser->nick;
+	  $nick = 'you' if $nick eq $from_nick;
+	  Say( $self,
+	       $dest_nick,
+	       "ok, $from_nick, I now associate $nick with ".$party->name,
+	       $first_person
+	      );
+      }
+
+      return;
+  }
+
+  # This test must be performed prior to the 'xxx has yyy' test
+  # xxxx has just left yyyy
+  # I have just left yyyy
+  if($command =~ /^(\S+)\s+(?:has\s+|have\s+)?(?:just\s+)?(?:left|departed)\s+(\S+)$/i) {
+      my $individual = $1;
+      my $searchname = $2;
+      if ($individual =~ /^(?:me|i)$/i) { $individual = $from_nick }
+      # $individual = ucfirst($individual);
+      my $conf = $channel->{BridgeConference};
+      my $msg;
+      my ($party, $ambig) = FindConfParty( $conf, $searchname );
+
+      if ($party) {
+	  if (defined $party->{Holds}) {
+	      if (my $i = InList($individual, $party->{Holds})) {
+		  $party->{Holds} =~ s/(?:,\s*)?\Q$i\E//i;
+		  $msg = "-$i; got it";
+	      }
+	      else {
+		  $msg = "$from_nick, I was not aware that $individual was in $searchname";
+	      }
+	      $party->{Holds} =~ s/^,\s+//;
+	  }
+	  else {
+	      $msg = "$from_nick, I was not aware that anyone was in $searchname";
+	  }
+      }
+      Say( $self,
+	   $dest_nick,
+	   $party ? $msg
+		  : $ambig ? "'$searchname' is ambiguous, $from_nick"
+			   : "sorry, $from_nick, I do not recognize a party named '$searchname'",
+	   $first_person );
+      return;
+  }
+
+  # This test must be performed prior to the 'xxx has yyy' test
+  # please close the queue, please [re]open the queue
+  # please give xxx the last word
+  # xxx has the last word
+  if($command =~ /^(?:please\s+|pls\s+)?((?:close|open|reopen))\s+(?:the\s+|)queue$/i ||
+     $command =~ /^(?:please\s+|pls\s+|)(?:give\s+|)(\S+)\s+(has\s+)?the\s+last\s+word$/i) {
+      my $which = $1;
+      my ($queuedName, $speakerNote);
+      if ($command =~ /last\s+word$/i) {
+	  my $speaker = $which;
+	  $speaker = NameFromNick($from_nick) if $speaker eq 'me';
+	  ($queuedName, $speakerNote) =
+	      AcknowledgeSpeaker( $speaker, $channel );
+	  $channel->{SpeakerQueue} = [];
+	  $channel->{SpeakerNotes} = [];
+	  $which = 'closed and cleared';
+      } elsif ($which =~ m/close/i) {
+	  $channel->{QueueIsClosed} = 1;
+	  $which = 'closed';
+      } else {
+	  delete $channel->{QueueIsClosed};
+	  $which = 'open';
+      }
+
+      Say( $self, $dest_nick, "ok, $from_nick, the speaker queue is $which",
+	   $first_person );
+
+      Say( $self, $dest_nick, "$queuedName, you wanted to $speakerNote", 1 )
+	  if $speakerNote;
+
+      return;
+  }
+
+  # xxxx also holds yyyy
+  # xxxx also has yyyy
+  # xxxx holds yyyy, xxxx has yyyy
+  if($command =~ /^(\S+)\s+(?:now\s+|)(?:also\s+|)(?:contains|has|holds)\s+(.+)$/i) {
+      my $searchname = $1;
+      my $holds = $2;
+      my $also = ($command =~ /^\S+\s+(?:now\s+|)also\s+/i);
+
+      my $conf = $channel->{BridgeConference};
+      my ($party, $ambig) = FindConfParty( $conf, $searchname );
+      unless ($party) {
+	  Say( $self,
+	       $dest_nick,
+	       $ambig ? "'$searchname' is ambiguous, $from_nick"
+		      : "sorry, $from_nick, I do not recognize a party named '$searchname'",
+	       $first_person );
+	  return;
+      }
+
+      DropAttendee( $Conference{$conf->id}, $party->name )
+	  unless $also || $party->{Holds};
+
+      $holds =~ s/, +/,/g;
+      $holds =~ s/([^,]) +/$1,/g;
+      my @names = split( /,/, $holds);
+      $holds = '';
+      my $sep = '';
+
+      foreach my $name (@names) {
+	  next if $name eq 'and';
+	  $name = $from_nick if ($name =~ m/^(?:me|i)$/i);
+	  # $name = ucfirst($name);
+	  if (my $n = InList($name, $party->{Holds})) {
+	      Say( $self,
+		   $dest_nick,
+		   "$n was already listed in ".$party->name.", $from_nick",
+		   $first_person );
+	      next;
+	  }
+	  AddAttendee( $Conference{$conf->id}, $name );
+	  $holds .= $sep.$name;
+	  $sep = ', ';
+      }
+      if ($holds) {
+	  if ($also) {
+	      my $was = $party->{Holds} || $party->name;
+	      $party->{Holds} = $was.', '.$holds;
+	  }
+	  else {
+	      $party->{Holds} = $holds;
+	  }
+	  $conf->{HasTransientParties} = 1;
+	  Say( $self,
+	       $dest_nick,
+	       "+$holds; got it",
+	       $first_person );
+      }
+      return;
+  }
+
+  # xxxx no longer holds yyyy
+  if($command =~ /^(\S+)\s+no\s+longer\s+(?:contains|has|holds)\s+(.+)$/i) {
+      my $searchname = $1;
+      my $holds = $2;
+
+      my $conf = $channel->{BridgeConference};
+      my ($party, $ambig) = FindConfParty( $conf, $searchname );
+      unless ($party) {
+	  Say( $self,
+	       $dest_nick,
+	       $ambig ? "'$searchname' is ambiguous, $from_nick"
+		      : "sorry, $from_nick, I do not recognize a party named '$searchname'",
+	       $first_person );
+	  return;
+      }
+
+      $holds =~ s/, +/,/g;
+      $holds =~ s/([^,]) +/$1,/g;
+      my @names = split( /,/, $holds);
+      $holds = '';
+      my $sep = '';
+
+      foreach my $name (@names) {
+	  next if $name eq 'and';
+	  if ($name =~ m/^(?:me|i)$/i) {
+	      $name = $from_nick;
+#	      my $ircUser = IRCuser::find($name);
+#	      delete $ircUser->{party} if $ircUser;
+	  }
+
+	  # $name = ucfirst($name);
+	  if (my $n = InList($name, $party->{Holds})) {
+	      $name = $n;
+	      $party->{Holds} =~ s/(?:^|,\s*)\Q$name\E(?:,|$)/,/i;
+	  }
+	  else {
+	      Say( $self,
+		   $dest_nick,
+		   "$name was not listed in ".$party->name.", $from_nick",
+		   $first_person );
+	  }
+	  $holds .= $sep.$name;
+	  $sep = ', ';
+      }
+      if ($holds) {
+	  $party->{Holds} =~ s/^[, ]*//;
+	  $party->{Holds} =~ s/[, ]*$//;
+	  $conf->{HasTransientParties} = 1;
+	  Say( $self,
+	       $dest_nick,
+	       "-$holds; got it",
+	       $first_person );
+      }
+      return;
+  }
+
+  # xxxx is no longer with yyyy
+  # xxxx no longer is with yyyy
+  # xxxx is no longer in yyyy
+  # I am no longer in yyyy
+  if($command =~ /^(\S+)\s+(?:is\s+|am\s+|)no\s+longer\s+(?:is\s+|)(?:with|in)\s+(\S+)$/i) {
+      my $searchname = $2;
+      my $name = $1;
+
+      my $conf = $channel->{BridgeConference};
+      my ($party, $ambig) = FindConfParty( $conf, $searchname );
+      unless ($party) {
+	  Say( $self,
+	       $dest_nick,
+	       $ambig ? "'$searchname' is ambiguous, $from_nick"
+		      : "sorry, $from_nick, I do not recognize a party named '$searchname'",
+	       $first_person );
+	  return;
+      }
+
+      if ($name =~ m/^(?:me|i)$/i) {
+	  $name = $from_nick;
+#	  my $ircUser = IRCuser::find($name);
+#	  delete $ircUser->{party} if $ircUser;
+      }
+      # $name = ucfirst($name);
+      if (my $n = InList($name, $party->{Holds})) {
+	  $name = $n;
+	  $party->{Holds} =~ s/(?:^|,\s*)\Q$name\E(?:,|$)/,/i;
+	  $party->{Holds} =~ s/^[, ]*//;
+	  $party->{Holds} =~ s/[, ]*$//;
+	  $conf->{HasTransientParties} = 1;
+	  Say( $self,
+	       $dest_nick,
+	       "-$name; got it",
+	       $first_person );
+      }
+      else {
+	  Say( $self,
+	       $dest_nick,
+	       "$name was not listed in ".$party->name.", $from_nick",
+	       $first_person );
+      }
+
+      return;
+  }
+
+  # caution: this regex must not match 'drop agendum nnn' or 'drop agenda nnn'
+  # please drop xxxx
+  if($command =~ /^(?:please\s+|pls\s+)?(?:disconnect|drop|hangup)\s+(\S+)$/i) {
+      my $searchname = $1;
+
+      Say( $self, $dest_nick, "sorry, $from_nick, I can't do that anymore", $first_person );
+      return;
+  }
+
+  # please list conferences
+  if($command =~ /^(?:please\s+|pls\s+)?(?:what\s+conferences(?:\s+are\s+active|\s+do\s+you\s+see)?\s*\?|list\s+conferences|list)$/i) {
+      my $list = '';
+      my $sep = '';
+      foreach my $c (values %Conference) {
+	  unless (defined $c->{conf}) {
+	      print '*** ',__LINE__,' undefined conf ', $c, "\n"; # @@ debugging
+	      next;
+	  }
+	  next if ! $c->{active};
+	  my $name = $c->{conf}->name();
+	  $list .= $sep.$name;
+	  $sep = ', ';
+      }
+
+      # list scheduled conferences that have not already started
+      my $scheduled = '';
+      $sep = '';
+      my $now = time;
+      my $is_are = 'is';
+
+      Schedule::Enumerate(
+	  sub
+	  {
+	      my ($resv) = @_;
+	      # if a reservation is in place for now or start in the next 15
+	      # minutes and has not already started, list it
+	      my $name = $resv->name;
+	      if ( $resv->start < ($now + 900) &&
+		   ($resv->start + $resv->duration*60) > $now &&
+		   $list !~ /\Q$name\E/ ) {
+		  $scheduled .= $sep.$name;
+		  $is_are = 'are' if $sep;
+		  $sep = ', ';
+	      }
+	  }
+      );
+
+      my $also = $list ? 'also ' : '';
+      my $others = ($list || $scheduled) ? 'no others' : 'none';
+
+      Say( $self,
+	   $dest_nick,
+	   ($first_person ? 'I see ' : 'sees ')
+		.($list ? "$list active" : 'no active conferences')
+		.($scheduled ? '' : " and $others scheduled to start in the next 15 minutes"),
+	   $first_person );
+
+      Say( $self,
+	   $dest_nick,
+	   ($first_person ? "${also}scheduled at this time $is_are " : 'sees in schedule ').$scheduled,
+	   $first_person ) if $scheduled;
+
+      return;
+  }
+
+  # this conference will be xxxx
+  if($command =~ /^(?:this\s+will\s+be|this\s+conference\s+will\s+be)\s+(.+)$/i) {
+    my $searchname = $1;
+
+    $channel->{ConfDescription} = $1;
+
+    Say( $self, $dest_nick, "ok, $from_nick", $first_person );
+    return;
+  }
+
+  # what conference is this?
+  if($command =~ /^(?:what|which)\s+conference\s+is\s+this\s*\?$/i) {
+      my $description = $channel->{ConfDescription}
+      			|| GetChannelConfDescription($channel);
+      if (defined $description) {
+	Say( $self,
+	     $dest_nick,
+	     "I have been told this is $description",
+	     $first_person );
+      }
+      else {
+	Say( $self, $dest_nick, "no conference has been identified yet, $from_nick", $first_person )
+      }
+      return;
+  }
+
+  # what is the conference code?
+  if($command =~ /^(?:what|)(?:'s\s+the\s+|\s+is\s+the\s+|)\s*(?:conference|pass|)\s*code\s*\?$/i) {
+      my $description = $channel->{ConfDescription}
+      			|| GetChannelConfDescription($channel);
+      if (defined $description) {
+	Say( $self,
+	     $dest_nick,
+	     "I have been told this is $description",
+	     $first_person );
+      }
+      else {
+	Say( $self, $dest_nick, "no conference has been identified yet, $from_nick", $first_person )
+      }
+      return;
+  }
+
+  # are you busy?
+  if($command =~ /^(?:are\s+you\s+)?(?:busy\s*\?)$/i) {
+    my ($where, $idle);
+    for my $channel (@::Channels) {
+	if ($channel->{Listening} && $channel != $AdminChannel) {
+	    $where .= ' '.$channel->{NAME};;
+	    $idle .= ' '.$channel->{NAME}.'='
+		  .int ((time - $channel->{MsgTime} + 30)/60);
+	}
+    }
+    Say( $self, $dest_nick,
+		   $where ? "I'm listening on$where"
+			  : "no, $from_nick, I'm not listening anywhere",
+		$first_person );
+    Say( $self, $dest_nick, 'Idle mins:'.$idle, $first_person ) if $idle;
+    if ($where) {
+	for my $confID (keys %Conference) {
+	    unless (defined $Conference{$confID}->{conf}) {
+		print '*** ',__LINE__,' undefined conf ', $confID, "\n"; # @@ debugging
+		next;
+	    }
+	    if ($Conference{$confID}->{active}
+		&& $Conference{$confID}->{conf}->{IRCChannel}) {
+		my $channel = $Conference{$confID}->{conf}->{IRCChannel};
+		my $partycount = $Conference{$confID}->{partyCount};
+		my $plural = $partycount == 1 ? '' : 's';
+		Say( $self, $dest_nick, $channel->{NAME}.' has '.$Conference{$confID}->{conf}->name.' with '.$partycount.' participant'.$plural, $first_person );
+	    }
+	}
+    }
+    return;
+  }
+
+  # please ignore the agenda, please track the agenda
+  if($command =~ /^(?:please\s+|pls\s+)?((?:ignore|track))\s+(?:the\s+|)agenda$/i) {
+      my $which = $1;
+      if ($which eq 'ignore') {
+	  $channel->{IgnoreAgenda} = 1;
+      }
+      else {
+	  delete $channel->{IgnoreAgenda};
+      }
+      Say( $self, $dest_nick, "ok, $from_nick, I will $which the agenda",
+	   $first_person );
+      return;
+  }
+
+  # please ignore the queue, please track the queue
+  if($command =~ /^(?:please\s+|pls\s+)?((?:ignore|track))\s+(?:the\s+|)queue$/i) {
+      my $which = $1;
+      if ($which eq 'ignore') {
+	  $channel->{IgnoreQueue} = 1;
+      }
+      else {
+	  delete $channel->{IgnoreQueue};
+      }
+      Say( $self, $dest_nick, "ok, $from_nick, I will $which the speaker queue",
+	   $first_person );
+      return;
+  }
+
+  # please ping me in xx minutes|hours about yyy, please remind me in xx minutes|hours ...
+  if($command =~ /^(?:please\s+|pls\s+)?((?:ping|remind))\s+(?:me\s+|us\s+)?in\s+([0-9]+)\s*((?:minutes|minute|mins|min|m|hours|hour|h))?\s*((?:about|aboot|to|that))?\s*(.*)$/i) {
+      my $what = $1;
+      my $interval = $2*60;
+      my $units = $3;
+      my $aboutPresent = $4;
+      my $reminder = $5;
+      if ($reminder && ! $aboutPresent) {
+          Say( $self, $dest_nick, "I don't understand the last part of that, $from_nick; about what am I supposed to $what you?" );
+	  return;
+      }
+      $interval *= 60 if $units =~ m/^h/;
+      my $finalReminder = $channel->{FinalReminder} || 0;
+      $channel->{FinalReminder} = time + $interval
+	  unless $finalReminder > time + $interval;
+      $self->schedule( $interval,
+		       sub
+		       {
+			   Say( $self,
+				$dest_nick,
+				"$from_nick, you asked to be ${what}ed at this time"
+				.($aboutPresent ? " $aboutPresent $reminder" : ''),
+				$first_person
+			       );
+		       }
+		      );
+      Say( $self, $dest_nick, "ok, $from_nick", $first_person );
+      return;
+  }
+
+  # please allow this agenda item xx minutes
+  if($command =~ /^(?:please\s+|pls\s+)?(?:allow|give)\s+this\s+(?:agenda\s+item|item|agendum|)\s+([0-9]+)\s*(?:minutes|minute|mins|min|m)?$/i) {
+      my $interval = $1*60;
+      my $which = $channel->{CurrentAgendum};
+      unless ($which) {
+	  Say( $self,
+	       $dest_nick,
+	       "I do not know what agendum has been taken up, $from_nick",
+	       $first_person );
+	  return;
+      }
+      $self->schedule( $interval,
+		       sub
+		       {
+			   Say( $self,
+				$dest_nick,
+				"Agendum $which was to have been concluded at this time",
+				$first_person
+			      ) if $which == $channel->{CurrentAgendum};
+		       }
+		      );
+
+      my $deltaInterval =
+	  $interval >= 600 ? 5 : 
+	  $interval >= 300 ? 2 :
+	  $interval >= 120 ? 1 :
+	  0;
+
+      if ($deltaInterval) {
+	  $self->schedule( $deltaInterval * 60,
+			   sub
+			   {
+			       Say( $self,
+				    $dest_nick,
+				    "Agendum $which is scheduled to conclude in $deltaInterval minute".($deltaInterval > 1 ? 's' : ''),
+				    $first_person
+				  ) if $which == $channel->{CurrentAgendum};
+			   }
+			  );
+      }
+
+      Say( $self, $dest_nick, "ok, $from_nick", $first_person );
+      return;
+  }
+
+  # time each speaker at xx minutes|seconds
+  # allow each speaker xx minutes|seconds
+  # give each speaker xx minutes|seconds
+  if($command =~ /^(?:please\s+|pls\s+)?(?:time|allow|give)(\s+(?:each\s+|)speakers?)?(\s+at)?\s+(\d+)\s*((?:minutes|mins|min|m|seconds|secs|sec|s))$/i) {
+      my $talkTime = $3;
+      $talkTime = $talkTime * 60 if $4 =~ /^m/;
+      if ($talkTime < 60) {
+	  Say( $self,
+	       $dest_nick,
+	       "60 seconds is the minimum, $from_nick",
+	       $first_person
+	      );
+	  return;
+      }
+      $channel->{SpeakerTalkTime} = $talkTime;
+      Say( $self, $dest_nick, "ok, $from_nick", $first_person );
+      return;
+  }
+
+  # stop timing speakers
+  if($command =~ /^(?:please\s+|pls\s+)?stop\s+timing(\s+speakers)?$/i) {
+      if ($channel->{SpeakerTalkTime}) {
+	  delete $channel->{SpeakerTalkTime};
+	  ++$channel->{TalkTimerVersion} if $channel->{TalkTimerVersion};
+	  Say( $self, $dest_nick, "ok, $from_nick", $first_person );
+      }
+      else {
+	  Say( $self,
+	       $dest_nick,
+	       ($first_person ? 'I ' : '').'was not timing speakers, '.$from_nick,
+	       $first_person
+	     );
+      }
+      return;
+  }
+
+  # choose a scribe
+  # pick a victim
+  if($command =~ /^(?:please\s+|pls\s+)?(?:propose|pick|choose|select|nominate)\s+a\s+(?:scribe|victim)(\s+(?:except\s+|other\s+than\s+)(.*))?$/i) {
+      my $present = $channel->{Present};
+      my $count = $present ? @{$present} : 0;
+
+      unless ($present && $count) {
+	  Say( $self, $dest_nick, "I don't who is present, $from_nick", 1);
+	  return;
+      }
+
+      my $exceptions = $2;
+      if ($exceptions) {
+	  $exceptions =~ s/, +/,/g;
+	  $exceptions =~ s/ *$//;
+	  $exceptions =~ s/([^,]) +/$1,/g;
+
+	  my $shortlist = [@$present];
+	  $present = $shortlist;
+	  my @names = split( /,/, $exceptions);
+
+#	  print 'present=', join(',', @{$present}), "\n";
+#	  print 'names=', join(',', @names), "\n";
+
+	  foreach my $name (@names) {
+	      $name = NameFromNick($from_nick) if ($name eq 'me');
+	      my $position = FindInArray( $present, $name, undef );
+	      splice( @{$present}, $position, 1 ) if defined $position;
+	  }
+	  $count = @{$present};
+
+#	  print 'trimmed present=', join(',', @{$present}), "\n";
+
+	  unless ($count) {
+	      Say( $self,
+		   $dest_nick,
+		   'I only see '.join( ', ', @{$channel->{Present}} ),
+		   1
+		  );
+	      return;
+	  }
+      }
+      
+      my $nominee = int( rand $count );
+#      print "count=$count, nominee=$nominee\n";
+
+      Say( $self,
+	   $dest_nick,
+	   'Not knowing who is chairing or who scribed recently, I propose '.@{$present}[$nominee],
+	   1
+	 );
+      return;
+  }
+
+  if($command =~ /\sgo\s+home\??$/i) {
+      Say( $self, $dest_nick, "You can go home any time you like, $from_nick" );
+      return;
+  }
+
+  # [please] join <channel> [<password>]
+  if ($command =~ m/^(?:please\s+|pls\s+)?join\s+(\S*)\s*(\S*)$/) {
+      my $channel_name = $1;
+      my $channel_key = $2;
+      print "join $channel_name $channel_key from $from_nick\n";
+      log_admin_event($self, $event, time, "Join request for $channel_name from $from_nick");
+      $self->join($channel_name, $channel_key);
+      return;
+  }
+
+  # please list attendees
+  # please list participants
+  if($command =~ /^(?:please\s+|pls\s+|)list\s+(?:attendees|participants)$/i) {
+
+      my $attendees = $channel->{Attendees};
+      if ($attendees && @{$attendees}) {
+	  $attendees = join( ', ', @$attendees );
+      } else {
+	  $attendees = "(no one)"
+      }
+
+      Say( $self, $dest_nick, 'As of this point the attendees have been '.$attendees );
+      return;
+  }
+
+  # please list irc attendees
+  # please list irc participants
+  if($command =~ /^(?:please\s+|pls\s+|)list\s+irc\s+(?:attendees|participants)$/i) {
+    my @rest = @{$channel->{NicksPresent}};
+    Say( $self, $dest_nick, 'Those currently present on irc are:', $first_person );
+    while(@rest && (my $nick = shift @rest)) {
+	Say( $self,
+	     $dest_nick,
+	     $nick->nick.' '.$nick->address.' ('.($nick->fullname || '').')',
+	     $first_person
+	   );
+    }
+    Say( $self, $dest_nick, ". end of irc participants", $first_person );
+    return;
+  }
+
+  # please read xxx from yyy
+  if($command =~ /^(?:please\s+|pls\s+|)read\s+(\S+)\s+from\s+(\S+)$/i) {
+      my $form = $1;
+      my $source = $2;
+
+      my $cmd = "make INPUT='$source' $form|";
+      local *HANDLE;
+      unless (open(HANDLE, $cmd)) {
+	  Say( $self,
+	       $dest_nick,
+	       "sorry, $from_nick, got an error from that source",
+	       $first_person
+	     );
+	  return;
+      }
+
+      my $h = *HANDLE;
+      $h->blocking(0);
+
+      my $closure = {
+	  'conn'	=> $self,
+	  'handle'	=> $h,
+	  'event'	=> $event,
+	  'channelN'	=> $channel_name,
+	  'dest_nick'	=> $dest_nick,
+	  'is_private'	=> $is_private,
+	  'addressed'	=> $first_person,
+	  'done_msg'	=> "done reading $form, $from_nick",
+      };
+
+      $::IRC->addfh($h, \&ProcessReaderHandler, 'r', $closure);
+
+      Say( $self,
+	   $dest_nick,
+	   "working on it, $from_nick",
+	   $first_person
+	 );
+
+      return;
+  }
+
+  $output = "";			# @@ RRS
+
+  if($command=~ /^(?:please\s+|pls\s+)?help/i) {
+    my(@help)=(
+      'Please refer to http://www.w3.org/2001/12/zakim-irc-bot for more detailed help.',
+      'Some of the commands I know are:',
+      ' xxx is yyy       - establish yyy as the name of unknown party xxx',
+      "                    if yyy is 'me' or 'I', your nick is substituted",
+      ' xxx may be yyy   - establish yyy as possibly the name of unknown party xxx',
+      ' I am xxx         - establish your nick as the name of unknown party xxx',
+      ' xxx holds yyy [, zzz ...] - establish xxx as a group name and yyy, etc. as participants within that group',
+      ' xxx also holds yyy - add yyy to the list of participants in group xxx',
+      " who's here?      - lists the participants on the phone",
+      ' is xxx here?     - reports whether a party named like xxx is present',      ' list conferences - reports the active conferences',
+      ' this is xxx      - associates this channel with conference xxx',
+      ' excuse us        - disconnects from the irc channel',
+    );
+    for my $output (@help) {
+       Say ($self, $dest_nick, $output, $first_person );
+    }
+    return;
+  }
+
+  if($command =~ /^adminhelp/i) {
+    my(@help)=(
+      "Administrative commands are as follows:",
+      "These commands work only with the admin PASSWORD like this:",
+      "/msg $::Nick password PASSWORD command'",
+    );
+    for my $output (@help) {
+      Say( $self, $dest_nick, $output, $first_person );
+    }
+    return;
+  }
+
+  if($command =~ /^thank(?:s|\s+you)$/) {
+    Say( $self, $dest_nick,
+	 ($first_person ? '' : 'says ')
+	   ."you are very welcome, $from_nick",
+	 $first_person );
+    return;
+  }
+
+  return if watch_significant_events($self, $event, $channel_name, $command, $is_private, $first_person, $from_read_process);
+
+  if($command =~ /^(?:who\s+is|who's)\s+not\s+making\s+any\s+sense\?$/) {
+    Say( $self, $dest_nick,
+	 ($first_person ? 'I ' : '').'refrain'.($first_person ? ' ' : 's ')
+	   ."from answering on grounds of self-preservation, $from_nick",
+	 $first_person );
+    return;
+  }
+
+  if($command =~ /^(?:who\s+is|who's)\s+your\s+daddy\?$/) {
+    Say( $self, $dest_nick,
+	 ($first_person ? '' : 'says ')
+	   ."Ralph is taking good care of me but you all are my family, $from_nick",
+	 $first_person );
+    return;
+  }
+
+  # hit me (aka "pick a random agendum")
+  if ($command =~ m/^\s*(?:please\s+|pls\s+)?hit\s+me$/i) {
+      $channel->{MsgTime} = time;
+      Say( $self,
+	   $dest_nick,
+	   ($first_person
+	      ? "I believe you are asking for a random agendum, $from_nick"
+	      : "believes $from_nick is asking for a random agendum"),
+	   $first_person );
+
+      if ($channel->{IgnoreAgenda}) {
+	  Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+	      if $first_person;
+	  return;
+      }
+      if ($is_private) {
+	  Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	  return;
+      }
+
+      if ($channel->{CurrentAgendum} && $#{$channel->{SpeakerQueue}} >= 0) {
+	  Say( $self,
+	       $dest_nick,
+	       ($first_person ? 'I see' : 'sees').' a speaker queue remaining and respectfully decline'.($first_person ? '' : 's').' to close this agendum'.($first_person ? ", $from_nick" : ''),
+	       $first_person
+	     );
+	  return;
+      }
+
+      delete $channel->{QueueIsClosed};
+
+      my $which = 0;
+      my $agenda = $channel->{Agenda};
+      unless ($agenda) {
+	  Say( $self,
+	       $dest_nick,
+	       ($first_person ? 'I see' : 'sees').' nothing on the agenda',
+	       $first_person
+	      );
+	  return;
+      }
+
+      # close the current agendum only if it has been taken up more than
+      # a minute ago
+      if (my $agendum_index = $channel->{CurrentAgendum}) {
+	  if (time - $channel->{CurrentAgendumStarted} < 60) {
+	      Say( $self,
+		   $dest_nick,
+		   ($first_person ? 'I am' : 'is')
+		      ." not closing agendum $agendum_index",
+		   $first_person
+		  );
+	  } else {
+	      $agendum_index -= 1;	# agenda is 0-based
+	      delete $channel->{CurrentAgendum};
+	      if ($agendum_index <= $#{$agenda}) {
+		  my $agendum = @{$agenda}[$agendum_index];
+		  $agendum->{Closed} = 1;
+	      }
+	  }
+      }
+
+      my $agendumCount = $#{$agenda} + 1;
+      my $agendum_index = 0;
+      my @openitems = ();
+      for my $agendum (@{$agenda}) {
+	  $agendum_index++;
+	  unless ($agendum->{Closed} ||
+		  $agendum->{Dropped} ||
+		  $agendum->{Skipped} ||
+		  ($channel->{CurrentAgendum} && $agendum_index == $channel->{CurrentAgendum})) {
+	      push @openitems, $agendum_index;
+	  }
+      }
+
+      if ($#openitems < 0) {
+	  Say( $self,
+	       $dest_nick,
+	       ($first_person ? 'I do' : 'does').' not see any more non-closed or non-skipped agenda items'.
+		 ($first_person ? ", $from_nick" : ''),
+	       $first_person
+	      );
+	  return;
+      }
+      $which = @openitems[ int( rand ($#openitems + 1))] - 1;
+
+      if ($which <= $#{$agenda}) {
+	  my $agendum = @{$agenda}[$which];
+	  $channel->{CurrentAgendum} = $which + 1; # keep this 1-based
+	  $channel->{CurrentAgendumStarted} = time;
+	  Say( $self,
+	       $dest_nick,
+	       ($first_person ? '' : 'thinks ').
+	       'agendum '.($which+1).' -- '.$agendum->{Topic}.' -- taken up'
+		  .($agendum->{Submitter}
+		    ? ' [from '.$agendum->{Submitter}.']'
+		    : ''),
+	       $first_person
+	      );
+      }
+      else {
+	  my $length = $#{$agenda}+1;
+	  my $msg = ($first_person
+		      ? "I'm confused; I see "
+		      : 'is confused; sees ')
+		    .$length
+		    .' item'.($length == 1 ? '' : 's')
+		    .' on the agenda and tried to take up item '
+		    .$which;
+	  Say( $self, $dest_nick, $msg, $first_person );
+	  log_admin_event($self, $event, time, $msg);
+      }
+      return;
+  }
+
+  # start meeting
+  if ($command =~ m/^\s*(?:please\s+|pls\s+)?(?:start\s+|prepare\s+)(?:the|this|)\s*meeting$/i)
+  {
+      InviteLogger( $self, $channel, $dest_nick, $from_nick, $first_person );
+      return;
+  }
+
+  # end meeting
+  if ($command =~ m/^\s*(?:please\s+|pls\s+)?end\s+(?:the|this|)\s*meeting$/i)
+  {
+      # See "please list attendees"
+      my $attendees = $channel->{Attendees};
+      if ($attendees && @{$attendees}) {
+	  $attendees = join( ', ', @$attendees );
+      } else {
+	  $attendees = "(no one)"
+      }
+
+      Say( $self, $dest_nick, 'As of this point the attendees have been '.$attendees );
+
+      my ($logACL, $minutesStyle, $meetingName, $loggerRequests) = GetChannelMeetingData($channel);
+
+      Say( $self, $dest_nick, "$LoggerBot, please draft minutes $minutesStyle" );
+
+      $self->schedule( 5,
+		       sub
+		       {
+			   Say( $self, 
+				$dest_nick, 
+				"I am happy to have been of service, $from_nick; please remember to excuse $LoggerBot.  Goodbye" );
+			   $self->schedule( 4,
+					    sub
+					    {
+						LeaveChannel( $self, 
+							      $channel, 
+							      $event, 
+							      $channel_name );
+					    }
+			       		  );
+		       }
+		     );
+
+      return;
+  }
+
+  # No command was recognized ...
+  # Alan's favorite historic error message
+  if($command =~ /^(?:who's here|who is here|what conference is this|what conferences|is\s+\S+\s+here)$/i) {
+    $output.="$from_nick, you need to end that query with '?'";
+  }
+  elsif ($command =~ /\?$/) {
+    $output.="I don't understand your question, $from_nick.";
+  }
+  elsif ($command =~ /[:;]-?\)/) {
+    $output.="I'm glad that smiley is there, $from_nick";
+  }
+  else {
+    log_admin_event( $self, $event, time, "($channel_name) '$command' not recognized" );
+    $output.="I don't understand ".
+        (length($command) < 40 ? "'$command'" : 'you').
+        ", $from_nick";
+  }
+
+  Say( $self, $dest_nick, $output, $first_person );
+}
+
+
+# Implements the rules for matching strings to party names
+# Inputs: conference, searchname
+#   searchname is a simple string; any unambiguous prefix matches
+# Returns: (party, 0) or (undef, ambig) where ambig is 0 if no match else 1
+sub FindConfParty
+{
+    my ($conf, $searchname) = @_;
+
+    return (undef, 0) unless $conf;
+
+    my $foundParty = undef;
+
+    foreach my $party (values %partyName) {
+	my $name = $party->name;
+	if ($party->conf &&
+	    $party->conf == $conf &&
+	    $name =~ m/^\Q$searchname\E/i) {
+	    if ($foundParty) {
+		# when multiple matches are found, look for an exact match
+		if ($name =~ m/^\Q$searchname\E\??$/i) {
+		    if ($foundParty->name =~ m/^\Q$searchname\E\??$/i) {
+			return (undef, 1); # both are exact matches
+		    }
+		}
+		else {
+		    if ($foundParty->name !~ m/^\Q$searchname\E\??$/i) {
+			return (undef, 1); # neither is an exact match
+		      }
+		    else {
+			next;	# foundParty is a better match
+		    }
+		}
+	    }
+	    $foundParty = $party;
+	}
+    }
+    return ($foundParty, 0) if $foundParty; # found an unambiguous match
+
+    # still not found; if party name contains '.' or '-' or '_',
+    # attempt a match while ignoring those characters
+    foreach my $party (values %partyName) {
+	my $name = $party->name;
+	next unless ($party->conf &&
+		     $party->conf == $conf &&
+		     $name =~ m/[-._]/);
+
+	$name =~ s/\.a*$//; # trim any trailing .a*
+	$name =~ s/[-._]//g; # strip out any of '-._'
+
+	if ($name =~ m/^\Q$searchname\E/i) {
+	    if ($foundParty) {
+		# when multiple matches are found, look for an exact match
+		if ($name =~ m/^\Q$searchname\E\??$/i) {
+		    if ($foundParty->name =~ m/^\Q$searchname\E\??$/i) {
+			return (undef, 1); # both are exact matches
+		    }
+		}
+		else {
+		    if ($foundParty->name !~ m/^\Q$searchname\E\??$/i) {
+			return (undef, 1); # neither is an exact match
+		      }
+		    else {
+			next;	# foundParty is a better match
+		    }
+		}
+	    }
+	    $foundParty = $party;
+	}
+    }
+    return ($foundParty, 0) if $foundParty; # found an unambiguous match
+
+    # if still not found try the "[name]" variant
+    return FindConfParty($conf, "[$searchname]") unless $searchname =~ m/^\[/;
+
+    return (undef, 0);
+}
+
+# If a party name already appears in a conference, add a unique suffix
+# Inputs: conference, partyname
+# Returns: partyname
+sub UniquePartyName
+{
+    my ($conf, $name) = @_;
+    my $isGroup = 0;
+
+    my ($party, $ambig) = FindConfParty( $conf, $name );
+
+    if ($party) {
+	if ($name =~ /^\[(.*)\]$/) {
+	    $name = $1;
+	    $isGroup = 1;
+	}
+	my $suffix = 'a';
+	$name .= '.';
+	while ($party) {
+	    $name .= $suffix;
+	    ($party, $ambig) = FindConfParty( $conf,
+					      $isGroup ? "[$name]" : $name );
+	}
+    }
+    return $isGroup ? "[$name]" : $name;
+}
+
+
+# Inputs: conference, oldname, newname, flags
+#   oldname is a full regex
+#   flags = 'U' - uncertain
+#	    'T' - transient
+# Returns: party if found else undef
+sub RenameConfParty
+{
+    my ($conf, $searchname, $newname, $flags) = @_;
+
+    my ($party, $ambig) = FindConfParty( $conf, $searchname );
+
+    return undef if not defined $party;
+
+    # if the proposed new name would collide with an existing name, alter it
+    my $uniqnewname = $newname;
+    {
+	my ($testParty) = FindConfParty( $conf, $newname );
+	if ($testParty && $testParty->name eq $newname) {
+	    $uniqnewname = UniquePartyName( $conf, $newname );
+	}
+    }
+
+    $party->name($uniqnewname);
+    if ($flags eq 'U') {
+	$party->{NameIsUnsure} = 1;
+    }
+    else {
+	delete $party->{NameIsUnsure};
+    }
+
+    delete $party->{NameIsUnknown};
+
+    return $party;
+}
+
+
+my %OutputQueue;		# {nick}->@{queue}
+my $SayScheduled = 0;
+my $OutputBytesPending = 0;	# total bytes we're expecting to write
+my $nextNickInQueue;		# round-robin the queue
+
+# Queued output to the irc server; this tries to avoid flooding the
+# server with output requests and the liklihood that the server will
+# kick us
+#
+# Accepts: $conn - connection
+#	   $nick - the channel name or nick to be addresses
+#	   $msg  - the text to send
+#	   $addressed - (optional) boolean: 1 if privmsg, 0 if /me
+sub Say {
+    my ($conn, $nick, $msg, $addressed) = @_;
+    my $to = ref($nick) eq "ARRAY" ? join('~', @{$nick}) : $nick;
+
+    $addressed = 1 if not defined $addressed;
+    my $overflow = undef;
+
+    my $linelimit = 180;
+
+    if (length($msg) > $linelimit) {	# split long results
+	for (my $cp = $linelimit; $cp>40; $cp--) {
+	    if (substr($msg, $cp, 1) =~ /\s/) {
+		$overflow = '...'.substr($msg, $cp);
+		$msg = substr($msg, 0, $cp);
+		last;
+	    }
+	}
+	unless ($overflow) {
+	    $overflow = '... '.substr($msg, $linelimit);
+	    $msg = substr($msg, 0, $linelimit);
+	}
+    }
+
+    my @queues = keys %OutputQueue;
+
+    # when queue is empty, output immediately but set timer
+    # safe time to next output depends on the size of this output text;
+    # thanks to Hugo Haas for recommending the algorithm.
+
+    my $msgLength = length($msg) + ($addressed ? 9 : 18);
+    # 9 = length('PRIVMSG '),  18 = length('PRIVMSG :^AACTION ')
+
+    if (! $SayScheduled) {
+	if ($addressed) { $conn->privmsg($nick, $msg) }
+	else { $conn->me($nick, $msg) }
+	my $interval =  1 + int $msgLength/80;
+	$conn->schedule($interval, \&_doSay);
+	$SayScheduled++;
+    }
+    else {
+	my $queue = \@{$OutputQueue{$to}->{queue}};
+	push @$queue, [$conn, $nick, $msg, $addressed];
+	$OutputBytesPending += $msgLength;
+    }
+
+    Say( $conn, $nick, $overflow, $addressed ) if $overflow;
+}
+
+sub _doSay {
+    my ($conn) = @_;		# ignored
+    my $bytesWritten = 0;	# accumulator for this invocation
+
+    $SayScheduled = 0;		# assume we're done
+
+    while ($bytesWritten < 500) { # try to send at least this much text
+	my @nicks = keys %OutputQueue;
+	my $nicksRemaining = $#nicks + 1;
+
+	return unless $nicksRemaining;
+
+	my $nickToOutput = $nextNickInQueue ? $nextNickInQueue : $nicks[0];
+	my $interval = 1;	# time to next safe output
+
+	my $queue = \@{$OutputQueue{$nickToOutput}->{queue}};
+	if ( $#$queue >= 0) {
+	    my $conn = $$queue[0][0];
+	    my $nick = $$queue[0][1];
+	    my $msg = $$queue[0][2];
+	    my $addressed = $$queue[0][3];
+
+	    # safe time to next output depends on the size of this output text;
+	    # thanks to Hugo Haas for recommending part of the algorithm.
+
+	    my $msgLength = length($msg) + ($addressed ? 9 : 18);
+	    # 9 = length('PRIVMSG '),  18 = length('PRIVMSG :^AACTION ')
+
+	    last if $bytesWritten && ($bytesWritten + $msgLength) > 500;
+
+	    shift @$queue;
+
+	    # the more output we have to do, the more likely it is that a
+	    # slow client will cause our output queue in the server to build
+	    # Therefore we add more penalty as a function of the number of
+	    # bytes we expect to output
+	    $interval = 1 + int ($msgLength/($OutputBytesPending > 320 ? 60 : 100));
+
+	    if ($addressed) { $conn->privmsg($nick, $msg) }
+	    else { $conn->me($nick, $msg) }
+
+	    $OutputBytesPending -= $msgLength;
+	    $bytesWritten += $msgLength;
+	}
+
+	if ($#$queue < 0) {
+	    delete $OutputQueue{$nickToOutput};
+	    $nicksRemaining--;
+	}
+
+	if ($nicksRemaining) {
+	    # repeat until queue is drained
+	    $conn->schedule($interval, \&_doSay) if !$SayScheduled++;
+	}
+
+	my $next = 1;
+	for my $nick (@nicks) {
+	    last if $nick eq $nickToOutput;
+	    $next++;
+	}
+
+	$nextNickInQueue = $nicks[$next];
+    }
+}
+
+sub do_announce
+{
+    my ($conn, $message, $first_person) = @_;
+    for my $channel (@::Channels) {
+	Say( $conn, $channel->{NAME}, $message, $first_person )
+	    if $channel->{Listening};
+    }
+}
+
+my @WhoIsQueue = ();		# whois nick requests
+my $WhoIsScheduled = 0;
+
+# Queue WHOIS requests so as not to flood the server
+#
+# Accepts: $conn - connection
+#	   $nick - nick to query
+sub WhoIs
+{
+    my ($conn, $nick) = @_;
+
+    return unless $nick;
+
+    my $interval = 2 + int ($OutputBytesPending || 0)/80;
+
+    if (!$WhoIsScheduled) {
+	$conn->whois( $nick );
+	$conn->schedule($interval, \&_doWhoIs);
+	$WhoIsScheduled = 1;
+    } else {
+	push @WhoIsQueue, $nick;
+    }
+}
+
+sub _doWhoIs
+{
+    my ($conn) = @_;
+
+    $WhoIsScheduled = 0;	# assume no more to query
+
+    return unless @WhoIsQueue;
+
+    # compute stall time as function of outstanding requests and Say() output
+    my $interval = 2 + int (($#WhoIsQueue * 10) + ($OutputBytesPending || 0))/80;
+
+    $conn->whois( shift @WhoIsQueue );
+
+    if (@WhoIsQueue) {
+	$conn->schedule($interval, \&_doWhoIs);
+	$WhoIsScheduled = 1;
+    }
+}
+
+
+sub AdminNotice
+{
+    my ($message) = @_;
+    Say( $AdminChannel->{CONN}, $AdminChannel->{NAME}, $message)
+	if $AdminChannel->{Listening};
+}
+
+# on forced disconnect, report what channels had output for debugging
+sub log_pending_output($)
+{
+    my ($self) = @_;
+    my @queuedNicks = keys %OutputQueue;
+    my $msg;
+    $OutputBytesPending = 0 unless $OutputBytesPending;
+    unless (@queuedNicks) {
+	$msg = "no output is queued.  $OutputBytesPending bytes pending.";
+    }
+    else {
+	$msg = "total of $OutputBytesPending bytes pending for ";
+	my $sep = '';
+	for my $nick (@queuedNicks) {
+	    my $Qentry = @{$OutputQueue{$nick}->{queue}}[0];
+	    my $to = @{$Qentry}[1];
+	    $msg.=$sep.(ref($to) eq "ARRAY" ? join('~', @{$to}) : $to);
+	    $sep = ', ';
+	}
+    }
+    log_admin_event($self, undef, time, $msg);
+}
+
+# Looks for messages to which to respond that are not directly addressed
+# to the bot.
+#
+# Returns 0 if no such message was found, else 1
+sub watch_significant_events ($$$$$$$) {
+    my($self, $event, $channel_name, $msg, $is_private, $addressed, $from_read_process)=@_;
+    my $from_nick=$event->nick;
+    my $channel= $is_private ? Channel_by_nick($from_nick)
+			     : Channel_by_name($channel_name);
+
+    my $dest_nick=($is_private ? $from_nick : join('',$event->to));
+
+    return 0 if !$channel;
+
+    $msg =~ s/ *$//;
+
+#    my $conf = $channel->{BridgeConference};
+#    return 0 unless $conf;
+
+    # queue+, queue-, queue=, sees xxx raise hand
+    if ($msg =~ m/^\s*(?:queue|q|qq)((?:-|\+\s+also|\+|=))[:=]?\s*(.*)$/i ||
+	$msg =~ m/^\s*((?:-|\+))(?:queue|q)\s*(.*)$/i ||
+	$msg =~ m/^\s*sees\s+(.*)((?:raises?\s+hands?|'s\s+hands?(?:\s+up|\s+down|)|lowers?\s+hands?))$/i
+#	||
+#	$msg =~ m/^\s*(.*)((?:raises?\s+hands?|hands?(?:\s+up|\s+down|)|lowers?\s+hands?))$/i
+       )
+    {
+
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreQueue}) {
+	    Say( $self, $dest_nick, "I am ignoring the speaker queue, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+
+	my $what = $1;
+
+	if ($channel->{QueueIsClosed} && $what ne '-') {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? "the speaker queue has been closed, $from_nick"
+			     : "whispers to $from_nick that the speaker queue has been closed"),
+		 $addressed );
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+
+	my $assign = $what eq '=' || $what eq ':';
+
+	my $hands = $2 || ($assign ? '' : 'me');
+
+	$what = '+' if $what =~ m/^\+\s+also/;
+	my $add = $assign || $what eq '+';
+
+	if ($msg =~ /^\s*q\s*=/i) {
+	    Say( $self,
+		 $dest_nick,
+		 "$from_nick, if you meant to query the queue, please say 'q?'; if you meant to replace the queue, please say 'queue= ...'",
+		 $addressed
+		);
+	    return 1;
+	}	
+	if ($what =~ m/(?:raise|lower)s?\s*$/i) { # 3rd regex is too greedy
+	    $hands = ($what =~ m/raises?\s*$/i) ? 'up' : 'down';
+	    $what =~ s/(?:raise|lower)s?\s*$//i;
+	}
+	unless ($what =~ /^[-+:=]$/) {
+	    $add = $hands !~ m/(?:^lower|down$)/;
+	    $assign = 0;
+	    $hands = $what || 'me';
+	}
+	my $note = undef;
+	if ($hands =~ m/^(\S* )?\s*((?:to\s+|on\s+|for\s+|re:?\s+|:\s*))(.*)$/i) {
+	    # permit optional what-I-wanted-to-say-was ...
+	    $hands = $1 ? $1 : 'me';
+	    my $style = $2;
+	    $note = $3;
+	    if    ($style =~ m/on/)	{ $note = 'comment on '.$note;	}
+	    elsif ($style =~ m/^:/)	{ $note = 'say '.$note;		}
+	    elsif ($style =~ m/re/)	{ $note = 'discuss '.$note;	}
+	    elsif ($style =~ m/for/)	{ $note = 'discuss '.$note;	}
+	    elsif ($style =~ m/about/)	{ $note = 'discuss '.$note;	}
+
+	} elsif ($hands =~ m/\w+\s+\w+\s+\w/)	{ # 3 or more words?
+	    # allow 'q+ re ...' as abbreviation for 'q: to comment re ...'
+	    if ($hands =~ m/^re /) {
+		$note = "comment ".$hands;
+		$hands = 'me';
+	    }
+	    else {
+		Say( $self,
+		     $dest_nick,
+		     "$from_nick, you typed too many words without commas; I suspect you forgot to start with 'to ...'",
+		     $addressed
+		   );
+		return 1;
+	    }
+	}
+	$hands =~ s/, +/,/g;
+	$hands =~ s/ *$//;
+	$hands =~ s/([^,]) +/$1,/g;
+
+	my $addToEnd = undef;
+	my $moveToEnd = undef;
+	if ($hands eq 'later') {
+	    $hands = 'me';
+	    $addToEnd = 1 if $add; 	# q+ later
+	    $moveToEnd = 1 unless $add;	# q- later
+	}
+
+	my @names = split( /,/, $hands);
+	my $currentQueue = $channel->{SpeakerQueue};
+	$currentQueue = [] if !$currentQueue || $assign;
+	my $currentNotes = $channel->{SpeakerNotes};
+	$currentNotes = [] if !$currentNotes || $assign;
+	{
+	    foreach my $name (@names) {
+		next if $name eq 'and' || $name eq '';
+		$name =~ s/'s$//; # allows just "Bob's hand [up|down]"
+		my $exact = $add || ($name eq 'me');
+		$name = NameFromNick($from_nick) if ($name eq 'me');
+		if ($msg =~ /^\s*qq\+/i) {
+		    # Quick q+
+		    my $lastSpeaker = $channel->{LastAckdSpeaker} || 'a previous speaker';
+		    $note = 'react to '.$lastSpeaker.($note ? ' to '.$note : '');
+		    unshift(@{$currentQueue}, $name); # ucfirst($name));
+		    unshift(@{$currentNotes}, $note);
+		    last;
+		}
+		my $position = FindInArray( $currentQueue, $name, $exact );
+		if ($add || $moveToEnd) {
+		    if (! defined $position || $addToEnd) {
+			push(@{$currentQueue}, $name); # ucfirst($name));
+			push(@{$currentNotes}, $note);
+		    }
+		    else {
+			my $oldNote = @{$currentNotes}[$position];
+			if ($moveToEnd) {
+			    splice( @{$currentQueue}, $position, 1 );
+			    splice( @{$currentNotes}, $position, 1 );
+			    if ($note) {
+				$note = $oldNote.' and to '.$note if $oldNote;
+			    }
+			    else {
+				$note = $oldNote;
+			    }
+			    push(@{$currentQueue}, $name);
+			    push(@{$currentNotes}, $note);
+			}
+			else {
+			    $note = $oldNote.' and to '.$note if $oldNote;
+			    @{$currentNotes}[$position] = $note;
+			}
+		    }
+		}
+		else {		# remove
+		    if (defined $position) {
+			splice( @{$currentQueue}, $position, 1 );
+			splice( @{$currentNotes}, $position, 1 );
+		    }
+		}
+	    }
+	}
+
+	$channel->{SpeakerQueue} = $currentQueue;
+	$channel->{SpeakerNotes} = $currentNotes;
+	$currentQueue = join( ', ', @{$currentQueue} );
+	$currentQueue = 'no one' unless $currentQueue;
+	Say( $self,
+	     $dest_nick,
+	     ($addressed ? 'I see ' : 'sees ').$currentQueue.' on the speaker queue',
+	     $addressed
+	    );
+	return 1;
+    }
+
+    # who is on the queue?
+    if ($msg =~ /^(?:who\s+is\s+on|who's\s+on|)(?:\s+the)?\s*q(ueue)?\s*\?/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreQueue}) {
+	    Say( $self, $dest_nick, "I am ignoring the speaker queue, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	my $currentQueue = $channel->{SpeakerQueue};
+	$currentQueue = join( ', ', @{$currentQueue}) if $currentQueue;
+	$currentQueue = 'no one' unless $currentQueue;
+	Say( $self,
+	     $dest_nick,
+	     ($addressed ? 'I see ' : 'sees ').$currentQueue.' on the speaker queue',
+	     $addressed
+	    );
+	return 1;
+    }
+
+    # please show the verbose|full queue
+    # vqueue
+    # vq
+    # qv
+    if ($msg =~ /^(?:please\s+|pls\s+|)(show\s+)?(the\s+)?(?:v(erbose\s+)?|full\s+)?q(ueue)?\s*(\?)?$/i ||
+	$msg =~ /^\s*qv\?$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreQueue}) {
+	    Say( $self, $dest_nick, "I am ignoring the speaker queue, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+
+	unless ($channel->{SpeakerQueue} && scalar(@{$channel->{SpeakerQueue}}))
+	{
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' no one on the speaker queue',
+		 $addressed
+	       );
+	    return 1;
+	}
+
+	my @currentQueue = @{$channel->{SpeakerQueue}};
+	my @currentNotes = @{$channel->{SpeakerNotes}};
+	
+	Say( $self,
+	     $dest_nick,
+	     'The speaker queue is:',
+	     $addressed
+	   );
+
+	foreach my $nick (@currentQueue)
+	{
+	    if (my $note = shift @currentNotes) 
+	    {
+		Say( $self,
+		     $dest_nick,
+		     "  $nick to $note",
+		     $addressed
+		   );
+	    }
+	    else
+	    {
+		Say( $self,
+		     $dest_nick,
+		     "  $nick",
+		     $addressed
+		   );
+	    }
+	}
+	
+	Say( $self,
+	     $dest_nick,
+	     '[end of queue]',
+	     $addressed
+	   );
+
+	return 1;
+    }
+
+    # chair acks xxx
+    # chair recognizes xxx
+    if ($msg =~ /^\s*(?:chair\s+|)(?:recognize|ack)s?\s+(\S+)$/i ||
+	$msg =~ /^\s*(?:chair\s+|)(?:recognize|ack)s?\s+(next)(?:\s+speaker)$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreQueue}) {
+	    Say( $self, $dest_nick, "I am ignoring the speaker queue, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	my $speaker = $1;
+	if ($speaker eq 'me') {
+	    $speaker = NameFromNick($from_nick);
+	} elsif ($speaker eq 'next') {
+	    $speaker = $channel->{SpeakerQueue}[0];
+	    Say( $self, $dest_nick, 'sees '.($speaker||'no one').' at the head of the speaker queue', 0 );
+	}
+
+	my ($queuedName, $speakerNote) =
+	    AcknowledgeSpeaker( $speaker, $channel );
+
+	Say( $self, $dest_nick, "$queuedName, you wanted to $speakerNote", 1 )
+	    if $speakerNote;
+
+	my $currentQueue = $channel->{SpeakerQueue};
+	$currentQueue = join( ', ', @{$currentQueue}) if $currentQueue;
+        $currentQueue = 'no one' unless $currentQueue;
+
+	Say( $self,
+	     $dest_nick,
+	     ($addressed ? 'I see ' : 'sees ').$currentQueue.' on the speaker queue',
+	     $addressed );
+
+	return 1;
+    }
+
+    # agenda+, agenda-, drop agendum n, remove agendum n, forget agendum n, delete agendum n
+    if ($msg =~ m/^\s*(?:agenda\s*|agendum\s*)([-+])[:=]?\s*(.*)$/i ||
+	$msg =~ m/^\s*(?:please\s+|)((?:drop|remove|forget|delete|skip))\s+(?:agenda|agendum|item)\s+([0-9]+)$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	my $what = $1;
+	my $add = $what eq '+';
+	my $agenda = $channel->{Agenda};
+	if ($add) {
+	    my $topic = $2;
+	    return 1 unless $topic;
+	    my $agendum = {};
+	    if ($topic =~ m/(.*)\s+\[(.*)\]$/) {
+		$agendum->{Topic} = $1;
+		if ($2) {
+		    $agendum->{Submitter} = $2;
+		    $agendum->{Via} = $from_nick
+			unless $from_read_process || lc($2) eq lc($from_nick);
+		}
+	    }
+	    else {
+		$agendum->{Topic} = $topic;
+		$agendum->{Submitter} = $from_nick unless $from_read_process;
+	    }
+	    if ($agenda) {
+		push(@{$agenda}, $agendum);
+	    } else {
+		$agenda = [$agendum];
+		$channel->{Agenda} = $agenda;
+	    }
+	    my $count = $#{$agenda} + 1;
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? '' : 'notes ').'agendum '.$count.' added',
+		 $addressed
+	       );
+	}
+	else {
+	    my $agendum = $2;
+	    my $skip = ($msg =~ m/skip/);
+	    if ($agendum !~ m/^\d+$/ || $agendum == 0) {
+		if ($addressed) {
+		    Say( $self,
+			 $dest_nick,
+			 'please refer to agenda item by number, '.$from_nick,
+			 1
+			);
+		}
+		return 1;
+	    }
+	    $agendum = $agendum - 1; # must be numeric
+	    if ($agenda) {
+		if ($agendum <= $#{$agenda}) {
+		    my $item = @{$agenda}[$agendum];
+		    ($skip ? $item->{Skipped} : $item->{Dropped}) = 1;
+
+		    Say( $self,
+			 $dest_nick,
+			 ($addressed ? '' : 'notes ').'agendum '.($agendum+1).', '.$agenda->[$agendum]->{Topic}.($skip ? ', skipped' : ', dropped'),
+			 $addressed
+			);
+		    if ($agendum+1 == ($channel->{CurrentAgendum} || -1)) {
+			delete $channel->{CurrentAgendum};
+		    }
+		}
+		elsif ($addressed) {
+		    my $length = $#{$agenda}+1;
+		    Say( $self,
+			 $dest_nick,
+			 'I only see '.$length.' item'.($length == 1 ? '' : 's').' on the agenda',
+			 1
+			);
+		}
+	    }
+	    else {
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? 'I see' : 'sees').' nothing on the agenda',
+		 $addressed
+	       );
+	    }
+	}
+	ExportAgenda($from_nick);
+	return 1;
+    }
+
+    # agenda nnn = xxx, agendum nnn = xxx
+    if ($msg =~ m/^\s*(?:agenda|agendum|item)\s*([0-9]*)\s*=\s*(.*)$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	my $which = $1;
+	my $agendum = {};
+	$agendum->{Topic} = $2;
+#	$agendum->{Submitter} = $from_nick;
+	my $agenda = $channel->{Agenda};
+	if ($which == 0) {
+	    if ($addressed) {
+		Say( $self,
+		     $dest_nick,
+		     'I can only replace agenda items by number',
+		     1
+		    );
+	    }
+	    return 1;
+	}
+	$which = $which - 1; # index must be numeric
+	if ($agenda) {
+	    if ($which <= $#{$agenda}) {
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? '' : 'notes ').'agendum '.($which+1).' replaced',
+		     $addressed
+		    );
+		splice @{$agenda}, $which, 1, $agendum;
+		}
+	    elsif ($addressed) {
+		my $length = $#{$agenda}+1;
+		Say( $self,
+		     $dest_nick,
+		     'I only see '.$length.' item'.($length == 1 ? '' : 's').' on the agenda',
+		     1
+		     );
+	    }
+	    ExportAgenda($from_nick);
+	}
+	else {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' nothing on the agenda',
+		 $addressed
+		);
+	}
+	return 1;
+    }
+
+    # agenda order is
+    if ($msg =~ m/^\s*(?:the\s+|)agenda\s+order\s+(?:is\s+|)([-,0-9\s]*)$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	my $order = $1;
+	unless ($order) {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'at least one agendum must be specified, '.$from_nick
+			     : 'sees no agenda order specified'),
+		 $addressed
+		);
+	    return 1;
+	}
+
+	unless ($channel->{Agenda}) {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see no agenda items yet, '.$from_nick
+			     : 'sees no agenda items yet'),
+		 $addressed
+		);
+	    return 1;
+	}
+
+	$channel->{AgendaOrder} = $order;
+	Say( $self,
+	     $dest_nick,
+	     ($addressed ? "ok, $from_nick" : 'notes agenda order'),
+	     $addressed
+	    );
+	return 1;
+    }
+
+    # close this agendum
+    if ($msg =~ m/^\s*(?:please\s+|pls\s+)?(really\s+)?close\s+this\s+(?:agenda|agendum|item)$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	my $which = $channel->{CurrentAgendum};
+	unless ($which) {
+	    Say( $self,
+		 $dest_nick,
+		 "I do not know what agendum had been taken up, $from_nick",
+		 $addressed );
+	    return 1;
+	}
+	my $agenda = $channel->{Agenda};
+	if ($which == 0) {
+	    if ($addressed) {
+		Say( $self,
+		     $dest_nick,
+		     'I can only close agenda items by number',
+		     1
+		    );
+	    }
+	    return 1;
+	}
+
+	if ($#{$channel->{SpeakerQueue}} >= 0) {
+	    unless ($msg =~ m/really/i) {
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? 'I see' : 'sees').' a speaker queue remaining and respectfully decline'.($addressed ? '' : 's').' to close this agendum'.($addressed ? ", $from_nick" : ''),
+		     $addressed
+		   );
+		return 1;
+	    }
+	}
+
+	$which = $which - 1; # index must be numeric
+	delete $channel->{CurrentAgendum};
+	if ($agenda) {
+	    if ($which <= $#{$agenda}) {
+		my $agendum = @{$agenda}[$which];
+		$agendum->{Closed} = 1;
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? '' : 'notes ').'agendum '.($which+1).' closed',
+		     $addressed
+		    );
+		ShowRemainingAgenda( $channel, $self, $dest_nick, $addressed, 1 );
+	    }
+	    else {
+		my $length = $#{$agenda}+1;
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? 'I only see ' : 'only saw ').$length.' item'.($length == 1 ? '' : 's').' on the agenda',
+		     $addressed
+		     );
+	    }
+	    ExportAgenda($from_nick);
+	}
+	else {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' nothing on the agenda',
+		 $addressed
+		);
+	}
+	return 1;
+    }
+
+    # close agendum nnn
+    if ($msg =~ m/^\s*(?:please\s+|pls\s+)?(?:really\s+)?close\s+(?:agenda|agendum|item)\s*([0-9]+)$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	my $which = $1;
+	my $agenda = $channel->{Agenda};
+	if ($which == 0) {
+	    if ($addressed) {
+		Say( $self,
+		     $dest_nick,
+		     'I can only close agenda items by number',
+		     1
+		    );
+	    }
+	    return 1;
+	}
+	$which = $which - 1; # index must be numeric
+	if ($agenda) {
+	    if ($which <= $#{$agenda}) {
+		if ($which+1 == ($channel->{CurrentAgendum} || -1)
+		    && $#{$channel->{SpeakerQueue}} >= 0) {
+		    unless ($msg =~ m/really/i) {
+			Say( $self,
+			     $dest_nick,
+			     ($addressed ? 'I see' : 'sees').' a speaker queue remaining and respectfully decline'.($addressed ? '' : 's').' to close this agendum'.($addressed ? ", $from_nick" : ''),
+			     $addressed
+			   );
+			return 1;
+		    }
+		}
+		my $agendum = @{$agenda}[$which];
+		$agendum->{Closed} = 1;
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? '' : 'notes ')
+			.'agendum '.($which+1)
+			.', '.$agendum->{Topic}.','
+			.' closed',
+		     $addressed
+		    );
+
+		delete $channel->{CurrentAgendum}
+		    if $which+1 == ($channel->{CurrentAgendum} || -1);
+
+		ShowRemainingAgenda( $channel, $self, $dest_nick, $addressed, 1 );
+	    }
+	    else {
+		my $length = $#{$agenda}+1;
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? 'I only see ' : 'only saw ').$length.' item'.($length == 1 ? '' : 's').' on the agenda',
+		     $addressed
+		     );
+	    }
+	    ExportAgenda($from_nick);
+	}
+	else {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' nothing on the agenda',
+		 $addressed
+		);
+	}
+	return 1;
+    }
+
+    # what's on the agenda?
+    # list the agenda
+    # show the agenda
+    if ($msg =~ /^(?:what\s+is|what's|)(?:\s+on)?(?:\s+the)?\s*agenda\s*\?/i ||
+        $msg =~ /^(?:list|show)(?:\s+the)?\s*agenda\s*/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+        ShowRemainingAgenda( $channel, $self, $dest_nick, $addressed );
+	return 1;
+    }
+
+    # take up agendum xxx
+    # open agendum xxx
+    # move to agendum xxx
+    if ($msg =~ m/^\s*(?:please\s+|pls\s+)?(?:take\s+up|open|move\s+to)\s+(?:agenda|agendum|item)\s*(.+)$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	my $which = $1;
+	my $agenda = $channel->{Agenda};
+
+	unless ($agenda) {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' nothing on the agenda',
+		 $addressed
+		);
+	    return 1;
+	}
+
+	unless ($which =~ m/^[0-9]+$/) {
+	    $which = "\Q$which\E"; # protect against regex's that might be dangerous
+	    my $index = 0;
+	    my $found = undef;
+	    foreach my $agendum (@{$agenda}) {
+		$index++;
+		if ($agendum->{Topic} =~ m/$which/i) {
+		    if (defined $found) {
+			Say( $self,
+			     $dest_nick,
+			     ($addressed ? '' : 'finds ').
+			       "'$which' matches agenda items $found and $index".
+			       ($addressed ? ", $from_nick" : ''),
+			     $addressed
+			    );
+			return 1;
+		    }
+		    $found = $index;
+		}
+	    }
+	    if (defined $found) {
+		$which = $found;
+	    }
+	    else {
+		Say( $self,
+		     $dest_nick,
+		     "'$which' does not match any agenda item".
+		       ($addressed ? ", $from_nick" : ''),
+		     $addressed
+		    );
+		return 1;
+	    }
+	}
+
+	delete $channel->{QueueIsClosed};
+
+	$which = $which - 1; # index must be numeric
+
+	if ($which <= $#{$agenda}) {
+	    my $agendum = @{$agenda}[$which];
+	    $channel->{CurrentAgendum} = $which + 1; # keep this 1-based
+	    $channel->{CurrentAgendumStarted} = time;
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? '' : 'thinks ').
+		 'agendum '.($which+1).' -- '.$agendum->{Topic}.' -- taken up'
+		    .($agendum->{Submitter}
+		      ? ' [from '.$agendum->{Submitter}
+			.($agendum->{Via} ? ' via '.$agendum->{Via} : '')
+			.']'
+		      : ''),
+		 $addressed
+		);
+	    delete $agendum->{Dropped};
+	    delete $agendum->{Skipped};
+	}
+	else {
+	    my $length = $#{$agenda}+1;
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I only see ' : 'only saw ').$length.' item'.($length == 1 ? '' : 's').' on the agenda',
+		 $addressed
+		 );
+	}
+
+	return 1;
+    }
+
+    # next agendum
+    if ($msg =~ m/^\s*(?:please\s+|pls\s+)?(?:take\s+up\s+|open\s+|move\s+to\s+)?next\s+(?:agenda|agenda\s+item|agendum|item)$/i ||
+	($addressed && $msg =~ m/^\s*(?:please\s+|pls\s+)?(?:take\s+up\s+|open\s+|move\s+to\s+)next(?:\s+agenda|\s+agendum|\s+item|)$/i)) {
+	$channel->{MsgTime} = time;
+	$addressed = 1 if $msg =~ m/move\s+to/i;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+
+	if ($channel->{CurrentAgendum} && $#{$channel->{SpeakerQueue}} >= 0) {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' a speaker queue remaining and respectfully decline'.($addressed ? '' : 's').' to close this agendum'.($addressed ? ", $from_nick" : ''),
+		 $addressed
+	       );
+	    return 1;
+	}
+
+	delete $channel->{QueueIsClosed};
+
+	my $which = 0;
+	my $agenda = $channel->{Agenda};
+	unless ($agenda) {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' nothing on the agenda',
+		 $addressed
+		);
+	    return 1;
+	}
+
+	# close the current agendum if it has been taken up at least
+	# a minute ago
+	if (my $agendum_index = $channel->{CurrentAgendum}) {
+	    if (time - $channel->{CurrentAgendumStarted} < 60) {
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? '' : 'thinks ').
+		       "agendum $agendum_index was just opened".
+		       ($addressed ? ", $from_nick" : ''),
+		     $addressed
+		    );
+		return 1;
+	    } else {
+		$agendum_index -= 1;	# agenda is 0-based
+		delete $channel->{CurrentAgendum};
+		if ($agendum_index <= $#{$agenda}) {
+		    my $agendum = @{$agenda}[$agendum_index];
+		    $agendum->{Closed} = 1;
+		}
+	    }
+	}
+
+        my $order = $channel->{AgendaOrder};
+	my $agendumCount = $#{$agenda} + 1;
+	while ($order) {
+	    (my $next, $order) = NextFromList($order, $agendumCount);
+	    if ($next > $agendumCount) {
+		Say( $self,
+		     $dest_nick,
+		     "skipping non-existent agendum $next",
+		     0
+		    );
+		next;
+	    }
+	    my $agendum = @{$agenda}[$next-1];
+	    unless ($agendum->{Closed} || $agendum->{Dropped} || $agendum->{Skipped}) {
+		$which = $next;
+		last;
+	    }
+	}
+	unless ($which) {
+	    my $agendum_index = 0;
+	    for my $agendum (@{$agenda}) {
+		$agendum_index++;
+		unless ($agendum->{Closed} || $agendum->{Dropped} || $agendum->{Skipped}) {
+		    $which = $agendum_index;
+		    last;
+		}
+	    }
+	}
+	if ($which == 0) {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I do' : 'does').' not see any more non-closed or non-skipped agenda items'.
+		   ($addressed ? ", $from_nick" : ''),
+		 $addressed
+		);
+	    return 1;
+	}
+	$which = $which - 1; # index must be numeric
+	if ($agenda) {
+	    if ($which <= $#{$agenda}) {
+		my $agendum = @{$agenda}[$which];
+		$channel->{CurrentAgendum} = $which + 1; # keep this 1-based
+		$channel->{CurrentAgendumStarted} = time;
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? '' : 'thinks ').
+		     'agendum '.($which+1).' -- '.$agendum->{Topic}.' -- taken up'
+			.($agendum->{Submitter}
+			  ? ' [from '.$agendum->{Submitter}.']'
+			  : ''),
+		     $addressed
+		    );
+	    }
+	    else {
+		my $length = $#{$agenda}+1;
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? 'I only see ' : 'only saw ').$length.' item'.($length == 1 ? '' : 's').' on the agenda',
+		     $addressed
+		     );
+	    }
+	}
+	else {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' nothing on the agenda',
+		 $addressed
+		);
+	}
+	return 1;
+    }
+
+    # what agendum?
+    # which agendum?
+    # current agendum?
+    if ($msg =~ m/^\s*(?:what|which|current)\s+(?:agenda|agendum|item)(?:\s+is\s+this|\s+is\s+open|\s+are\s+we\s+on)?\s*\?$/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+
+	my $agenda = $channel->{Agenda};
+	unless ($agenda) {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I see' : 'sees').' nothing on the agenda',
+		 $addressed
+		);
+	    return 1;
+	}
+
+	my $which = $channel->{CurrentAgendum};
+	unless ($which) {
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I do' : 'does').
+		   ' not know what agendum has been taken up'.
+		   ($addressed ? ", $from_nick" : ''),
+		 $addressed );
+	    return 1;
+	}
+
+	$which = $which - 1; # index must be numeric
+	if ($which <= $#{$agenda}) {
+	    my $agendum = @{$agenda}[$which];
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? '' : 'thinks ').
+		   'agendum '.($which+1).'. "'.$agendum->{Topic}.
+		   '" has been taken up'.
+		   ($addressed ? ", $from_nick" : ''),
+		 $addressed
+		);
+	}
+	else {
+	    my $length = $#{$agenda}+1;
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? 'I only see ' : 'only saw ').
+		   $length.' item'.($length == 1 ? '' : 's').' on the agenda'.
+		   ($addressed ? ", $from_nick" : ''),
+		 $addressed
+		 );
+	}
+	return 1;
+    }
+
+    # clear the agenda
+    if ($msg =~ /^(?:please\s+|pls\s+)?clear(\s+the)?\s+agenda/i) {
+	$channel->{MsgTime} = time;
+	if ($channel->{IgnoreAgenda}) {
+	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
+		if $addressed;
+	    return 1;
+	}
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	delete $channel->{Agenda};
+	delete $channel->{AgendaOrder};
+	delete $channel->{CurrentAgendum};
+	delete $channel->{CurrentAgendumStarted};
+	Say( $self,
+	     $dest_nick,
+	     ($addressed ? '' : 'notes ').'agenda cleared',
+	     $addressed
+	    );
+	ExportAgenda($from_nick);
+	return 1;
+    }
+
+    # present+, present-, present:
+    # +xxxx, -xxxx
+    if ($msg =~ m/^\s*present((?:-|\+|:|=))\s*(.*)$/i ||
+	$msg =~ /^\s*((?:-|\+))\s*(\D\S*)$/ )
+    {
+	$channel->{MsgTime} = time;
+
+	my $what = $1;
+	my $assign = $what eq ':' || $what eq '=';
+
+	my $who = $2 || ($assign ? '' : 'me');
+
+	my $add = $assign || $what eq '+';
+
+	$who =~ s/, +/,/g;
+	$who =~ s/ *$//;
+	$who =~ s/([^,]) +/$1,/g;
+
+	my @names = split( /,/, $who);
+	my $currentAttendees = $channel->{Attendees};
+	$currentAttendees = [] if !$currentAttendees || $assign;
+
+	my $currentPresent = $channel->{Present};
+	$currentPresent = [] if !$currentPresent || $assign;
+
+	{
+	    foreach my $name (@names) {
+		next if $name eq 'and' || $name eq '';
+		my $exact = ($name eq 'me');
+		$name = NameFromNick($from_nick) if ($name eq 'me');
+		my $position = FindInArray( $currentPresent, $name, $exact );
+		if ($add) {
+		    push(@{$currentPresent}, $name) if ! defined $position;
+ 
+		    $position = FindInArray( $currentAttendees, $name, $exact );
+		    push(@{$currentAttendees}, $name) if ! defined $position;
+		}
+		else {		# remove
+		    splice( @{$currentPresent}, $position, 1 ) if defined $position;
+		}
+	    }
+	}
+
+	$channel->{Attendees} = $currentAttendees;
+	$channel->{Present} = $currentPresent;
+
+	return 1;
+    }
+
+    # question+, question-
+    if ($msg =~ /^\s*(?:question|quest|ques)\s*(\d*)\s*([+-])(?:\+|-|)\s*(.*)$/i)
+    {
+	$channel->{MsgTime} = time;
+
+	my $digits = $1;
+	my $what = $2;
+	my $remainder = $3;
+
+	my $numericRemainder = ($remainder =~ /^(\d+)$/);
+	$digits = $1 unless $digits;
+	
+	if (! $digits && $remainder && ! $numericRemainder) {
+	    if ($remainder =~ /^(\d+)[+-]*$/) {
+		$digits = $1;
+	    }
+	}
+	my $isReference = (($digits ne '') || $numericRemainder);
+	
+	print "In Question: digits='$digits' what='$what' remainder='$remainder' isRef='$isReference'\n";
+
+	my $add = $what eq '+' && !$isReference;
+	my $addsupport = $isReference && $what eq '+';
+	my $dropsupport = $isReference && $what eq '-';
+
+	my $questions = $channel->{Questions};
+	if ($add) {
+	    my $topic = $remainder;
+	    unless ($topic) {
+		Say ( $self,
+		      $dest_nick,
+		      ($addressed ? '' : 'sees ').'no question text given',
+		      $addressed
+		    );
+		return 1;
+	    }
+
+	    unless ($channel->{QuestionSyntaxReminder} ||
+		    $topic =~ /^(?:who|what|when|where|why|how)/i) {
+		# only issue this reminder once
+		Say( $self,
+		     $dest_nick,
+		     'suggests that questions begin with who, what, when, where, why, or how',
+		     0
+		    );
+		$channel->{QuestionSyntaxReminder} = 1;
+	    }
+
+	    my $thisQuestion = {};
+	    $thisQuestion->{Topic} = $topic;
+	    $thisQuestion->{Supporters} = [ NameFromNick($from_nick) ];
+
+	    if ($questions) {
+		push(@{$questions}, $thisQuestion);
+	    } else {
+		$questions = [$thisQuestion];
+		$channel->{Questions} = $questions;
+	    }
+	    my $count = $#{$questions} + 1;
+	    Say( $self,
+		 $dest_nick,
+		 ($addressed ? '' : 'notes ').'question '.$count.' added',
+		 $addressed
+		);
+	    return 1;
+	}
+	elsif ($addsupport || $dropsupport) {
+	    unless ($#{$questions} >= 0) {
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? 'I see' : 'sees').' no questions',
+		     $addressed
+		    );
+		return 1;
+	    }
+
+	    my $index = $digits - 1; # must be numeric
+	    if ($index < 0) {
+		Say( $self,
+		     $dest_nick,
+		     "$digits is not a valid question number, $from_nick",
+		     $addressed
+		    );
+		return 1;
+	    }
+	    if ($index > $#{$questions}) {
+		my $length = $#{$questions}+1;
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? 'I only see ' : 'only sees ').$length.' question'.($length == 1 ? ', ' : 's, ').$from_nick,
+		     $addressed
+		    );
+		return 1;
+	    }
+		
+	    my $thisQuestion = @{$questions}[$index];
+	    my $supporters = $thisQuestion->{Supporters} || [];
+	    my $name = NameFromNick($from_nick);
+	    my $position = FindInArray( $supporters, $name, 1 );
+
+	    if ($addsupport) {
+		push( @{$supporters}, $name ) if (! defined $position);
+	    }
+	    else { # dropsupport
+		splice( @{$supporters}, $position, 1 ) if (defined $position);
+	    }
+
+	    Say( $self,
+		 $dest_nick,
+		 "ok, $from_nick",
+		 $addressed
+		);
+	    return 1;
+	}
+	else {
+	    print "? digits='$digits', what='$what', remainder='$remainder'\n";
+	}
+    }
+
+    # drop|close question
+    if ($msg =~ /^\s*((?:drop|close))\s+(?:question|quest|ques)\s*(.+)\s*$/i)
+    {
+	$channel->{MsgTime} = time;
+
+	my $verb = $1;
+	my $reference = $2;
+	my $index;
+
+	if ($reference =~ /^(\d+)$/) {
+	    $index = $1 - 1;
+	    if ($index < 0) {
+		Say( $self,
+		     $dest_nick,
+		     "$reference is not a valid question number, $from_nick",
+		     $addressed
+		    );
+		return 1;
+	    }
+	}
+	else {
+	    Say( $self,
+		 $dest_nick,
+		 'questions must be reference by number',
+		 $addressed
+	       );
+	    return 1;
+	}
+	
+	$verb = $verb eq 'drop' ? 'dropped' : 'closed';
+	my $questions = $channel->{Questions};
+
+	if ($#{$questions} >= 0) {
+	    if ($index <= $#{$questions}) {
+		my $thisQuestion = @{$questions}[$index];
+		$thisQuestion->{Dropped} = $verb;
+
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? '' : 'notes ').'question '.($index+1).', '.$thisQuestion->{Topic}.', '.$verb,
+		     $addressed
+		    );
+	    }
+	    else {
+		my $length = $#{$questions}+1;
+		Say( $self,
+		     $dest_nick,
+		     ($addressed ? 'I only see ' : 'only sees ').$length.' question'.($length == 1 ? '' : 's'),
+		     $addressed
+		   );
+	    }
+	}
+	else {
+	      Say( $self,
+		   $dest_nick,
+		   ($addressed ? 'I see' : 'sees').' no questions',
+		   $addressed
+		 );
+	}
+	return 1;
+    }
+
+
+    # list [all] questions
+    if ($msg =~ /^\s*(?:list|show)\s+(all\s+)?(the\s+)?(?:questions|quest|ques)\s*$/i ||
+        $msg =~ /^\s*questions\?\s*$/i) 
+    {
+	my $all = $1;
+
+	$channel->{MsgTime} = time;
+
+        ShowRemainingQuestions( $channel, $self, $dest_nick, $addressed, $all );
+	return 1;
+    }
+
+    # clear the questions
+    if ($msg =~ /^(?:please\s+|pls\s+)?clear(\s+the)?\s+questions/i) {
+	$channel->{MsgTime} = time;
+	if ($is_private) {
+	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
+	    return 1;
+	}
+	delete $channel->{Questions};
+	Say( $self,
+	     $dest_nick,
+	     ($addressed ? '' : 'notes ').'questions cleared',
+	     $addressed
+	    );
+	return 1;
+    }
+
+}
+
+# Parses a comma or space-separated list of elements of the form
+#   "n" or "n-m" or "n-" where n and m are integers
+# second argument specifies the largest 'm' for the form "n-"
+#
+# returns (first, rest) where first is the first integer and
+# rest is a new list adjusting for the removed value
+sub NextFromList($$)
+{
+    my ($list, $last) = @_;
+
+    $list =~ s/^(\d+)(.*)$/$2/;
+
+    my $first = $1;
+
+    if ($list =~ m/^-(\d*)/) {
+	my $thru = $1;
+	$thru = $last unless $thru;
+	if ($first == $thru) {
+	    $list =~ s/^-\d*//;
+	}
+	else {
+	    $list = ($first+1).$list;
+	}
+    }
+    $list =~ s/^[,\s]*//;
+    return ($first, $list);
+}
+
+# Count remaining un-closed agenda entries
+#
+sub RemainingAgendaCount($)
+{
+    my ($channel) = @_;
+    my $agenda = $channel->{Agenda} || [];
+    my $agendumRemaining = 0;
+    for my $agendum (@{$agenda}) {
+	$agendumRemaining++ unless $agendum->{Closed} || $agendum->{Dropped};
+    }
+    return $agendumRemaining;
+}
+
+# Give remaining un-closed agenda entries
+#
+sub ShowRemainingAgenda($$$$;$)
+{
+    my ($channel, $self, $dest_nick, $addressed, $howmany) = @_;
+    my $agenda = $channel->{Agenda} || [];
+    my $agendumRemaining = RemainingAgendaCount($channel);
+    my $agendumCount = $#{$agenda} + 1;
+    if ($agendumRemaining == 0) {
+	Say( $self,
+	     $dest_nick,
+	     ($addressed ? 'I see' : 'sees').' nothing '.
+	      ($agendumCount ? 'remaining ' : '').'on the agenda',
+	     $addressed
+	    );
+	if ($addressed
+	    && $channel->{ConferenceName}
+	    && $channel->{ConferenceName} =~ m/^Team_/) {
+
+	    my $conf = $channel->{BridgeConference};
+	    my $startTime = ($conf && $conf->id)
+		? $Conference{$conf->id}->{startTime}
+		: 0;
+
+	    my %eggs = (
+		'Team_MIT(site)'
+		    => {'topic' => 'spam', 'time' => 70},
+		'Team_Global(review)'
+		    => {'topic' => 'slide making tools', 'time' => 50},
+		'Team_Ralph'
+		    => {'topic' => 'testing', 'time' => 999}
+	    );
+	    for my $confName (keys %eggs) {
+		if ($channel->{ConferenceName} eq $confName) {
+		    Say( $self,
+			 $dest_nick,
+			 "... but you haven't talked enough about "
+			    .$eggs{$confName}->{topic},
+			 $addressed
+			) if time - $startTime < 60*$eggs{$confName}->{time};
+		}
+	    }
+	}
+	return;
+    }
+    my $remainingText = ':';
+    if ($howmany && $agendumRemaining > $howmany) {
+	$remainingText = '; the next one'.
+	    ($howmany == 1 ? ' is' : 's are');
+    }
+    Say( $self,
+	 $dest_nick,
+	 ($addressed ? 'I see ' : 'sees ').$agendumRemaining.' item'.
+	     ($agendumRemaining == 1 ? '' : 's').
+	     ($agendumCount ? ' remaining' : '').' on the agenda'.
+	     $remainingText,
+	 $addressed
+       );
+    $howmany = $agendumRemaining unless $howmany;
+    my @alreadyDisplayed = undef;
+    my $order = $channel->{AgendaOrder};
+    while ($order) {
+	(my $next, $order) = NextFromList($order, $agendumCount);
+	next if $next > $agendumCount;
+	my $agendum = @{$agenda}[$next-1];
+	next if $agendum->{Closed} || $agendum->{Dropped} || $agendum->{Skipped};
+	Say( $self,
+	     $dest_nick,
+	     $next.'. '.$agendum->{Topic}
+	       .($agendum->{Submitter}
+		 ? ' [from '.$agendum->{Submitter}
+		   .($agendum->{Via} ? ' via '.$agendum->{Via} : '')
+		   .']'
+		 : ''),
+	     $addressed
+	    );
+	last unless --$howmany;
+	$alreadyDisplayed[$next] = 1;
+    }
+    return unless $howmany;
+    my $agendum_index = 1;
+    my $skipped = undef;
+    for my $agendum (@{$agenda}) {
+	if ($agendum->{Closed} || $agendum->{Dropped} || $alreadyDisplayed[$agendum_index]) {
+	    $agendum_index++;
+	    next;
+	}
+	unless ($agendum->{Skipped}) {
+	    Say( $self,
+		 $dest_nick,
+		 $agendum_index++.'. '.$agendum->{Topic}
+		   .($agendum->{Submitter}
+		     ? ' [from '.$agendum->{Submitter}
+		       .($agendum->{Via} ? ' via '.$agendum->{Via} : '')
+		       .']'
+		     : ''),
+		 $addressed
+		);
+	    last unless --$howmany;
+	}
+	else {
+	    push (@$skipped, [$agendum_index++, $agendum]);
+	}
+    }
+    if ($skipped && $howmany) {
+	for my $pair (@$skipped) {
+	    my $agendum_index = @{$pair}[0];
+	    my $agendum = @{$pair}[1];
+	    Say( $self,
+		 $dest_nick,
+		 $agendum_index.'. '.$agendum->{Topic}
+		   .($agendum->{Submitter}
+		     ? ' [from '.$agendum->{Submitter}
+		       .($agendum->{Via} ? ' via '.$agendum->{Via} : '')
+		       .']'
+		     : '')
+		    .' [skipped]',
+		 $addressed
+		);
+	    last unless --$howmany;
+	}
+    }
+}
+
+
+# Give remaining un-answered questions
+#
+sub ShowRemainingQuestions($$$$;$)
+{
+    my ($channel, $self, $dest_nick, $addressed, $all) = @_;
+    my $questions = $channel->{Questions} || [];
+    my $questionsRemaining = RemainingQuestionCount($channel);
+    my $questionCount = $#{$questions} + 1;
+
+    $questionsRemaining = $questionCount if $all;
+    if ($questionsRemaining == 0) {
+	Say( $self,
+	     $dest_nick,
+	     ($addressed ? 'I see' : 'sees').' no questions'.
+	      ($questionCount ? ' remaining ' : ''),
+	     $addressed
+	    );
+	return;
+    }
+    Say( $self,
+	 $dest_nick,
+	 ($addressed ? 'I see ' : 'sees ').$questionsRemaining.' question'.
+	     ($questionsRemaining == 1 ? '' : 's').
+	     ((!$all && $questionCount) ? ' remaining:' : ':'),
+	 $addressed
+       );
+
+    my $question_index = 1;
+    my $sortedQuestions = [];
+
+    for my $question (@{$questions}) {
+	if (!$all && $question->{Dropped}) {
+	    $question_index++;
+	    next;
+	}
+
+	my $support = $#{$question->{Supporters}} + 1;
+
+	my $sortIndex = 0;
+	while ($sortIndex <= $#{$sortedQuestions} &&
+	       @{$sortedQuestions}[$sortIndex]->{support} >= $support) {
+	    $sortIndex++;
+	}
+	{
+	    my $q = {};
+	    $q->{support} = $support;
+	    $q->{index} = $question_index;
+	    $q->{question} = $question;
+	    splice( @{$sortedQuestions}, $sortIndex, 0, $q );
+	}
+	$question_index++;
+    }
+
+    for my $question (@{$sortedQuestions}) {
+
+	my $support = $question->{support};
+	$support = $support == 0 ? 'no supporters' 
+	    : ($support == 1 ? '1 supporter' : "$support supporters");
+
+	my $dropped = $question->{question}->{Dropped};
+	$dropped = $dropped ? " - $dropped" : '';
+	   
+	Say( $self,
+	     $dest_nick,
+	     'Q'
+	       .$question->{index}.': '.$question->{question}->{Topic}
+	       .' ('
+	       .$support
+	       .')'
+	       .$dropped,
+	     $addressed
+	    );
+    }
+}
+
+# Count remaining open questions
+#
+sub RemainingQuestionCount($)
+{
+    my ($channel) = @_;
+    my $questions = $channel->{Questions} || [];
+    my $questionsRemaining = 0;
+    for my $question (@{$questions}) {
+	$questionsRemaining++ unless $question->{Dropped};
+    }
+    return $questionsRemaining;
+}
+
+# FindInArray( arrayRef, elem [, exact] )
+# Searches the referenced array for an element starting with 'elem'
+#	if exact is true then the match must be exact (ignoring case);
+#	that is it must not have any additional characters
+# Returns undef if no such element is found or if multiple match but
+#		none is an exact match
+#	  the position of the unique matching element
+sub FindInArray(@)
+{
+    my ($arrayRef, $elem, $exact) = @_;
+    my $found = undef;
+    my $suffix = $exact ? '$' : '';
+    my $multiple = 0;
+    for (my $position = 0; $position <= $#{$arrayRef}; $position++) {
+	my $item = @{$arrayRef}[$position];
+	if ($item =~ m/^\Q$elem\E$suffix/i) {
+	    return $position if $exact || ($item =~ m/^\Q$elem\E$/i);
+	    $multiple = 1 if $found;
+	    $found = $position;
+	}
+    }
+    return $multiple ? undef : $found;
+}
+
+
+sub xml_escape ($) {
+  my $string=shift;
+  $string =~ s/\&/\&amp;/g;
+  $string =~ s/</\&lt;/g;
+  $string =~ s/>/\&gt;/g;
+  $string =~ s/[\x00-\x1F]//g;  # remove ASCII 0-31
+  $string =~ s/([\x80-\xFF])/"\&#".ord($1).";"/ge; # escape ASCII 128-255
+  $string;
+}
+
+
+sub ExportAgenda($)
+{
+    my ($from_nick) = @_;
+
+    return if ! $AgendaFile;
+
+    open( RDF, ">$AgendaFile" ) or return;
+
+    print RDF
+'<?xml-stylesheet type="text/css" href="http://www.w3.org/Team/2002/01/rdf-agenda.css" ?>
+<RDF xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  xmlns:dc="http://purl.org/dc/elements/1.1/"
+  xmlns:m="http://www.w3.org/2001/12/09mr#"
+  xmlns:mr76="http://www.w3.org/2000/11/mr76/minutes#">';
+    for my $channel (@::Channels) {
+	next if !$channel->{Agenda};
+	print RDF '
+<m:Teleconference>';
+	my $confName = $channel->{ConferenceName};
+	print RDF '
+  <m:name>', xml_escape($confName), '</m:name>' if $confName;
+	print RDF '
+  <m:location rdf:resource="', xml_escape($channel->{URI}), '" />' if $channel->{URI};
+	print RDF '
+  <mr76:agenda>
+    <Seq>
+      <m:time>',Timestamp(),'</m:time>';
+	for my $agendum (@{$channel->{Agenda}}) {
+	    print RDF '
+      <li><Description>
+        <dc:title>', xml_escape($agendum->{Topic}), '</dc:title>';
+	    print RDF '
+        <mr76:from>', xml_escape($agendum->{Submitter}), '</mr76:from>'
+	        if $agendum->{Submitter};
+	    print RDF '
+        <mr76:via>', xml_escape($agendum->{Via}), '</mr76:via>'
+	        if $agendum->{Via};
+	    print RDF '
+        </Description></li>';
+	}
+	print RDF '
+    </Seq>
+  </mr76:agenda>
+</m:Teleconference>
+';
+    }
+    print RDF '
+</RDF>
+';
+    close RDF;
+}
+
+sub ReapIdleChannels($)
+{
+    my ($conn) = @_;
+
+    for (my $index=0; $index <= $#::Channels; $index++) {
+	# have to use indexed-for since we intend to modify the array
+	my $channel = $::Channels[$index];
+	next if $channel->{BridgeConference}; # stay if conference is active
+	if ($channel->{Listening} && $channel != $AdminChannel) {
+	    # if nothing interesting has been heard from the channel in 2 hours
+	    # and we have no more reminders to send
+	    my $finalReminder = $channel->{FinalReminder} || 0;
+	    if ((time - $channel->{MsgTime}) > $ReaperThreshold &&
+		$finalReminder < time &&
+		(RemainingAgendaCount($channel) == 0)) {
+		$channel->{Listening} = 0;
+		log_admin_event($conn, undef, time, "$::Nick auto-departing $channel->{NAME}");
+		print "Auto-departing '$channel->{NAME}'\n";
+		$conn->me($channel->{NAME}, 'excuses himself; his presence no longer seems to be needed');
+		$conn->part($channel->{NAME});
+		splice(@::Channels, $index, 1);
+		redo;		# restart w/o incrementing
+	    }
+	}
+    }
+    $ReaperScheduled = 0;
+}
+
+sub ResetTalkTimer($$$)
+{
+    my ($channel, $timeLeft, $version) = @_;
+
+    my $conn = $channel->{CONN};
+    my $nextAlarm;
+
+    if ($timeLeft <= 15) {
+	$nextAlarm = 0;
+    }
+    elsif ($timeLeft <= 30) {
+	$nextAlarm = 15;
+    }
+    elsif ($timeLeft < 70) {
+	$nextAlarm = 30;
+    }
+    elsif ($timeLeft < 120) {
+	$nextAlarm = 60;
+    }
+    elsif ($timeLeft < 180) {
+	$nextAlarm = 90;
+    }
+    elsif ($timeLeft < 420) {
+	$nextAlarm = 120;
+    }
+    elsif ($timeLeft < 720) {
+	$nextAlarm = 300;
+    }
+    else {
+	$nextAlarm = 600;
+    }
+
+    $conn->schedule( $timeLeft - $nextAlarm,
+		     sub
+		     {
+			 return if $version != $channel->{TalkTimerVersion};
+			 if ($nextAlarm) {
+			     Say( $conn,
+				  $channel->{NAME},
+				  ($nextAlarm < 120
+				   ? "gives $nextAlarm second speaker warning to ".$channel->{LastAckdSpeaker}
+				   : 'gives '.($nextAlarm/60).' minute speaker warning to '.$channel->{LastAckdSpeaker}),
+				  0
+				 );
+			     ResetTalkTimer($channel, $nextAlarm, $version);
+			 }
+			 else {
+			     Say( $conn,
+				  $channel->{NAME},
+				  'chimes: speaking time is up, '.$channel->{LastAckdSpeaker},
+				  0
+				 );
+			 }
+		     }
+		   );
+}
+
+# Computes a party name corresponding to an IRC nick
+# This comes from an explicit mapping if given, otherwise strip trailing
+# digits from the nick
+#
+# Inputs: irc nick
+# Returns: party name
+sub NameFromNick
+{
+    my ($nick) = @_;
+    my $name;
+
+    my $ircUser = IRCuser::find($nick);
+
+    if ($ircUser && (my $party = $ircUser->{party})) {
+	$name = $party->name;
+    }
+    else {
+	$name = $nick;
+	$name =~ s/\d+$//;	# trim any trailing digits
+    }
+
+    return $name;
+}
+
+
+# Searches a comma-separated text list for a word, ignoring case
+# returns the word if present else the empty string.
+sub InList($$)
+{
+    my ($word, $list) = @_;
+    return 0 unless $list;
+    return ($list =~ m/(?:^|,\s*)(\Q$word\E)(?:,|$)/i) ? $1 : '';
+}
+
+
+sub ClientHandler($)
+{
+    my ($conn) = @_;
+
+    my $sock = $conn->{socket};
+    my $port = $conn->{port};
+    my $msg;
+
+    print "ClientHander: port $port\n";
+
+    unless (defined $sock->recv($msg, 2048)) {
+	print 'recv error from ', $conn->{peername}, ' [', $conn->{peerIP},
+	      '] on port ', $conn->{port};
+	if ($sock->peername()) {
+	    print "; closing socket\n";
+	}
+	else {
+	    print "; peer disconnected\n";
+	}
+	$::IRC->removefh($sock);
+	$sock->close;
+	$conn->{closer}() if ($conn->{closer});
+	return;
+    }
+
+    print 'recv: from ', $conn->{peername}, ' [', $conn->{peerIP}, "] on port $port\n";
+
+    print 'ClientHandler heard: ', $msg, "\n";
+    ($msg, my @queue) = split('\n', $msg);
+
+    unless ($msg) {		# empty message
+	print "no msg; closing client\n";
+	$::IRC->removefh($sock);
+	$sock->close;
+	$conn->{closer}() if ($conn->{closer});
+	return;
+    }
+
+    do {
+	my $m = $msg;
+	if ($conn->{handler}) {
+	    $conn->{handler}($conn, $msg);
+	}
+	else {
+	    print "Unknown initialization\n";
+	    $::IRC->removefh($sock);
+	    $sock->close;
+	}
+	$msg = shift(@queue);
+    } while $msg;
+}
+
+
+my %channelConferenceDescriptions; # persistent channel->{ConfDescription}
+
+# GetChannelConfDescription
+# Looks up a pre-assigned conference description using the irc channel name.
+# If no pre-assigned code is found, returns undef
+#
+# Input:
+#	channel		IRC channel object
+#
+# Returns:
+#	description
+
+sub GetChannelConfDescription
+{
+    my ($channel) = @_;
+
+    CheckChannelConfDescriptionFileChanged();
+    my $channel_name = lc($channel->{NAME});
+    if (scalar keys %channelConfDescription > 0) {
+	my $confDescription = $channelConfDescription{$channel_name}->{confDescription};
+	if ($confDescription) {
+	    $channel->{ConfDescription} = $confDescription;
+	}
+    }
+
+    return $channel->{ConfDescription};
+}
+
+
+# Reload the Conference Description file if it has a newer mod time than
+# when it was previously loaded.
+sub CheckChannelConfDescriptionFileChanged()
+{
+    return if (not defined $channelConfDescriptionFile);
+    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,
+	$mtime,$ctime,$blksize,$blocks)
+	= stat($channelConfDescriptionFile);
+
+    if (! defined $mtime) {
+	print "Channel Conference Description file $channelConfDescriptionFile missing\n";
+	return;
+    }
+
+    if ($mtime > $lastChannelConfDescriptionModTime) {
+	open CODES, "< $channelConfDescriptionFile"
+	    or do {
+		warn "Can't open channel conference description file $channelConfDescriptionFile\n";
+		return;
+	    };
+	while (<CODES>) {
+	    (my $channel_name, my $confDescription) = split('\t');
+	    $channel_name = lc($channel_name);
+	    $channelConfDescription{$channel_name}->{confDescription} = $confDescription;
+	}
+	close CODES;
+	$lastChannelConfDescriptionModTime = $mtime;
+	print scalar keys %channelConfDescription, " channel conference descriptions read\n";
+    }
+}
+
+# Rewrite the Conference Description file with the update from just one channel
+# Input:
+#	channel		IRC channel object
+#	all		flag to save all descriptions
+#
+# Returns:
+#			(updates external file)
+
+sub SaveChannelConfDescriptionFile
+{
+    my ($channel, $all) = @_;
+
+    return if (not defined $channel->{ConfDescription} ||
+	       not defined $channelConfDescriptionFile);
+
+    CheckChannelConfDescriptionFileChanged();
+
+    if (not defined $all) {
+	my $channel_name = lc($channel->{NAME});
+	$channelConfDescription{$channel_name}->{confDescription} =
+	    $channel->{ConfDescription};
+    }
+    else {
+	for my $channel (@::Channels) {
+	    my $channel_name = lc($channel->{NAME});
+	    if (defined $channel_name) {
+		$channelConfDescription{$channel_name}->{confDescription} =
+		    $channel->{ConfDescription};
+	    }
+	}
+    }
+
+    open (DESC, "> $channelConfDescriptionFile".($all ? '-all' : ''))
+	or do {
+	    warn "Can't open confDescriptionFile $channelConfDescriptionFile\n";
+	    return;
+	};
+
+    foreach my $channel_name (sort keys %channelConfDescription) {
+	print DESC "$channel_name\t",
+		   $channelConfDescription{$channel_name}->{confDescription},
+		   "\n";
+    }
+
+    close DESC;
+
+    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,
+	$mtime,$ctime,$blksize,$blocks)
+	= stat($channelConfDescriptionFile);
+
+    $lastChannelConfDescriptionModTime = $mtime;
+}
+
+
+# GetChannelMeetingData
+# Looks up a pre-assigned log ACL and meeting name
+# If no pre-assigned data is found, returns undef
+#
+# Input:
+#	channel		IRC channel object
+#
+# Returns:
+#	ACL, Minutes Style, Name, additional requests
+
+sub GetChannelMeetingData
+{
+    my ($channel) = @_;
+
+    CheckChannelMeetingDataFileChanged();
+    my $channel_name = lc($channel->{NAME});
+    my $logACL = $channelMeetingData{$channel_name}->{logACL};
+    my $minutesStyle = $channelMeetingData{$channel_name}->{minutesStyle};
+    my $meetingName = $channelMeetingData{$channel_name}->{meetingName};
+    my $loggerRequests = $channelMeetingData{$channel_name}->{loggerRequests};
+
+    if (not defined $logACL) {
+	if (substr($channel_name,0,1) eq '&') {
+	    $logACL = "Team-only";
+	}
+	else {
+	    $logACL = "Public";
+	}
+    }
+
+    return ($logACL, $minutesStyle, $meetingName, $loggerRequests);
+}
+
+# Reload the Meeting Data file if it has a newer mod time than
+# when it was previously loaded.
+#
+# record format is tab-separated:
+#	channelName logACL MinutesStyle MeetingName optionalLoggerRequests
+sub CheckChannelMeetingDataFileChanged()
+{
+    return if (not defined $channelMeetingDataFile);
+    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,
+	$mtime,$ctime,$blksize,$blocks)
+	= stat($channelMeetingDataFile);
+
+    if (! defined $mtime) {
+	print "Channel Meeting Data file $channelMeetingDataFile missing\n";
+	return;
+    }
+
+    if ($mtime > $lastChannelMeetingDataModTime) {
+	open MEETDATA, "< $channelMeetingDataFile"
+	    or do {
+		warn "Can't open channel Meeting Data file $channelMeetingDataFile\n";
+		return;
+	    };
+	while (<MEETDATA>) {
+	    chomp;
+	    my ($channel_name, $log_acl, $minutes_style, $meeting_name, @loggerRequests) = split('\t');
+	    next if ((not defined $channel_name) || ($channel_name =~ m/^(?:!|$)/));
+
+	    $channel_name = lc($channel_name);
+	    $channelMeetingData{$channel_name}->{logACL} = $log_acl;
+	    $minutes_style = "" if ($minutes_style eq '.');
+	    $channelMeetingData{$channel_name}->{minutesStyle} = $minutes_style;
+	    $channelMeetingData{$channel_name}->{meetingName} = $meeting_name;
+	    @{$channelMeetingData{$channel_name}->{loggerRequests}} = @loggerRequests;
+
+#	    print "Found meeting data for '$channel_name'\n";
+#	    if (@loggerRequests) {
+#		print "... with requests:\n";
+#		foreach my $request (@loggerRequests)
+#		{
+#		    print "-> '$request'\n";
+#		}
+#	    }
+	}
+	close MEETDATA;
+	$lastChannelMeetingDataModTime = $mtime;
+	print scalar keys %channelMeetingData, " channel meeting data records read\n";
+    }
+}
+
+# Invite logger to a channel, allowing time for logger to join before
+# issuing requests to it
+
+sub InviteLogger
+{
+    my ($conn, $channel, $dest_nick, $from_nick, $first_person, $delay) = @_;
+    
+    if (not defined $delay)
+    {
+	$delay = 2;
+    }
+    else
+    {
+	$delay *= 2;
+    }
+
+    my ($logACL, $minutesStyle, $meetingName, $loggerRequests) = GetChannelMeetingData($channel);
+    my $loggerBotPresent = undef;
+    my @nicks = @{$channel->{NicksPresent}};
+    while(@nicks && (my $nick = shift @nicks)) {
+	if ($nick->nick =~ $LoggerBot) {
+	    $loggerBotPresent = 1;
+	    last;
+	}
+    }
+    unless ($loggerBotPresent) {
+	Say( $conn, $dest_nick, "inviting $LoggerBot", $first_person );
+	$conn->invite($LoggerBot,$channel->{NAME});
+	$conn->schedule( $delay,	# wait for bot to join
+			 sub
+			 {
+			     InviteLogger( $conn, $channel, $dest_nick, $from_nick, $first_person, $delay );
+			 }
+		       );
+	return;
+    }
+    Say( $conn, $dest_nick, "$LoggerBot, make logs $logACL" );
+
+    if (defined $meetingName) {
+	Say( $conn, $dest_nick, "Meeting: $meetingName" );
+    }
+    else {
+	Say( $conn, $dest_nick, "please title this meeting (\"meeting: ...\"), $from_nick", $first_person );
+    }
+
+    if ($loggerRequests)
+    {
+	my @requests = @{$loggerRequests};
+	foreach my $request (@requests)
+	{
+	    Say( $conn, $dest_nick, $request );
+	}
+    }
+
+    return;
+}
+
+sub LeaveChannel($$$$)
+{
+    my ($conn, $channel, $event, $channel_name) = @_;
+	
+    $channel->{Listening} = 0;
+    # Log who told me to quit
+    log_admin_event($conn, $event, time, "$::Nick told to depart $channel_name");
+    $conn->part($channel_name);
+    for (my $index=0; $index <= $#::Channels; $index++) {
+	if ($::Channels[$index] == $channel) {
+	    print "Excused from '$channel_name'\n";
+	    splice(@::Channels, $index, 1);
+	    last;
+	}
+    }
+    return;
+}
+
+# Schedule a warning notice when a conference reservation is due to end
+# if the ports are needed by other reservations
+#
+# Input:
+#	Conference
+#	force	(boolean) forces warning when time has been exceeded
+#	neede	number of ports that must be freed
+
+sub ScheduleConfEndNotice
+{
+    my ($conf, $force, $prevPortsNeeded) = @_;
+
+    my $remaining = $conf->endTime;
+    return unless $Conference{$conf->id}->{active} && ($remaining || $force);
+
+    my $portsUsed = $Conference{$conf->id}->{partyCount};
+    my ($available, $idle) = Party::PortsAvailable();
+
+    if ($remaining) {		# check to see if ports must be freed
+	my ($tm, $portsReserved, undef, undef) =
+	    Schedule::PortsReserved($remaining + 5);
+	my ($unclaimed, undef, undef) = UnclaimedPorts($remaining + 5);
+	$portsReserved -= $unclaimed;
+	$prevPortsNeeded = $portsUsed + $portsReserved - $available;
+    }
+    else {
+	$prevPortsNeeded = 0 unless defined $prevPortsNeeded;
+	$remaining = 0;
+    }
+
+    $remaining -= time;
+    $remaining = 0 if $remaining < 0;
+
+    my $nextWarn;
+
+    if ($remaining > 600) {		# more than 10 minutes left
+	$nextWarn = $remaining - 600;	# warn at 10 minutes to end
+    }
+    elsif ($remaining > 300) {		# at least 5 minutes left
+	$nextWarn = $remaining - 300;	# warn at 5 minutes to end
+    }
+    elsif ($remaining > 120) {		# at least 2 minutes left
+	$nextWarn = $remaining - 120;	# warn at 2 minutes to end
+    }
+    elsif ($remaining > 60) {		# at least 1 minute left
+	$nextWarn = $remaining - 60;	# warn at 1 minute to end
+    }
+    else {
+	$nextWarn = $remaining;
+    }
+
+    my $conn = ($conf->{IRCChannel})
+	? $conf->{IRCChannel}->{CONN}
+        : $AdminChannel->{CONN};
+
+    print Timestamp(), ' ', $conf->name, ": remaining = $remaining, nextWarn = $nextWarn, portsNeeded = $prevPortsNeeded\n";
+
+    if ($nextWarn > 0) {
+	$conn->schedule( $nextWarn,
+	    sub
+	    {
+		return unless $Conference{$conf->id}->{active};
+
+		my $end = $conf->endTime;
+		my $portsNeeded = $prevPortsNeeded;
+		my $portsUsed = $Conference{$conf->id}->{partyCount};
+
+		if ($end) { # check to see if ports must be freed
+		    my ($tm, $portsReserved, undef, undef) =
+			Schedule::PortsReserved($end + 5);
+		    my ($unclaimed, undef, undef) = UnclaimedPorts($end + 5);
+		    $portsReserved -= $unclaimed;
+		    my ($available, $idle) = Party::PortsAvailable();
+		    $portsNeeded = 
+			$portsUsed + $portsReserved - $available;
+		}
+
+		if ($portsNeeded > 0) {
+		    # Check that some conference actually does start soon
+		    # "soon" is +- 5 mins from the end of this conference
+		    my $nextConfStart = FindNextConfStart($end - 300);
+		    my $tm = localtime($nextConfStart); # @@
+		    print "next conference starts on $tm\n"; # @@
+		    $portsNeeded = 0 if ($nextConfStart > $end + 300);
+		}
+
+		if ($portsNeeded > 0) {
+		    my $remaining = $end ? ($end - time) : 0;
+		    $remaining = ($remaining > 0)
+			? int( ($remaining + 59)/60 )
+			: 0;
+		    my $msg = $remaining
+			? "in $remaining minute"
+			    .(($remaining > 1) ? 's' : '')
+			: 'now';
+		    if ($portsNeeded >= $portsUsed) {
+			$msg .= '; all ports';
+		    }
+		    else {
+			$msg .= "; $portsNeeded port";
+			$msg .= 's' if $portsNeeded > 1;
+		    }
+		    $msg .= ' must be freed';
+		    $msg .= ' immediately' unless $remaining;
+
+		    AdminNotice( $conf->name.' to end '.$msg );
+
+		    my $channel = $conf->{IRCChannel};
+		    if ($channel && $channel->{Listening}
+			&& $Enable_TerminationWarnings)
+		    {
+			my $channel_name = $channel->{NAME};
+			Say( $channel->{CONN},
+			     $channel_name,
+			     "This conference is scheduled to end $msg" );
+		    }
+		}
+		ScheduleConfEndNotice($conf, 1, $portsNeeded);
+	    }
+	);
+	return;
+    }
+
+    # else $nextWarn <= 0; reached end of time slot
+    if ($prevPortsNeeded > 0) {
+	# if we need the ports for a conference starting about now,
+	# then disconnect parties else let this conference run over
+
+	my $now = time;
+	my $nextConfStart = FindNextConfStart($now - 300);
+	if ($nextConfStart > $now + 300) {
+	    $prevPortsNeeded = 0;
+	    print "conference is permitted to run into overtime\n";
+	}
+    }
+
+    if ($prevPortsNeeded > 0) {
+	my $channel = $conf->{IRCChannel};
+	if ($channel && $channel->{Listening}
+	    && $Enable_TerminationWarnings)
+	{
+	    my $channel_name = $channel->{NAME};
+	    my $s = $prevPortsNeeded > 1 ? 's' : '';
+	    my $msg = $Enable_AutoBreakdown ? "; disconnecting the most recent arrival$s" : '';
+	    Say( $channel->{CONN},
+		 $channel_name,
+		 "The time reserved for this conference has been exceeded. $prevPortsNeeded port$s must be freed$msg" );
+	}
+	DisconnectLatestArrival( $conf );
+    }
+    else {			# do not need ports now, but check again later
+	ScheduleConfOvertimeCheck($conf, 300);
+    }
+}
+
+
+# Locate the starting time of the next conference after the specified time
+#
+# Inputs: time
+#
+# Returns: time or undef if no reservation found
+
+sub FindNextConfStart
+{
+    my ($start) = @_;
+    my $nextConfStart = 0xefffffff;
+
+    Schedule::Enumerate(
+	sub
+	{
+	    my ($resv) = @_;
+	    $nextConfStart = $resv->start
+		if ($resv->start > $start && $resv->start < $nextConfStart);
+	}
+    );
+    return ($nextConfStart < 0xefffffff) ? $nextConfStart : undef;
+}
+
+
+# Warn a conference in overtime if its ports are needed by another
+# reservation and disconnect ports if necessary.
+#
+# Inputs: (conf, interval)
+#	conf	 conference that is running overtime
+#	interval time in seconds until next check, or until ports
+#		 are disconnected if they are needed
+
+sub ScheduleConfOvertimeCheck
+{
+    my ($conf, $interval) = @_;
+
+    my $portsUsed = $Conference{$conf->id}->{partyCount};
+    my $active = $Conference{$conf->id}->{active};
+
+    print "** non-zero partyCount of $portsUsed for inactive conference ",
+    	$conf->name, "\n" if $portsUsed && ! $active;
+
+    return unless $active && $portsUsed;
+
+    my $conn = ($conf->{IRCChannel})
+	? $conf->{IRCChannel}->{CONN}
+	: $AdminChannel->{CONN};
+
+    my ($tm, $portsReserved, $ports30, $ports60) =
+	Schedule::PortsReserved( time + $interval );
+
+    my ($unclaimed, $unclaimed30, $unclaimed60) =
+	UnclaimedPorts( time + $interval );
+
+    print "reserved=($portsReserved, $ports30, $ports60) unclaimed=($unclaimed, $unclaimed30, $unclaimed60)\n"; # @@
+
+    $portsReserved -= $unclaimed;
+
+    my ($available, $idle) = Party::PortsAvailable();
+    my $portsNeeded = $portsUsed + $portsReserved - $available;
+
+    print Timestamp(),' OvertimeCheck(', $conf->name, "); need $portsNeeded\n";
+
+    if ($portsNeeded > 0) {
+	# if we need the ports for a conference starting about now,
+	# then disconnect parties else let this conference run over
+
+	my $now = time;
+	my $nextConfStart = FindNextConfStart($now - 300);
+	if ($nextConfStart > $now + 300) {
+	    $portsNeeded = 0;
+	    print "conference is permitted to continue in overtime\n";
+	}
+    }
+
+    unless ($conn) {
+	print 'Undefined connection at ', __LINE__, ' for ', $conf->name,
+	      "; $portsNeeded ports needed, irc channel is ",
+	      ($conf->{IRCChannel}) ? '' : 'not ', "defined\n";
+	return;
+    }
+
+    if ($portsNeeded > 0) {
+	my $msg = ' in overtime; ';
+	if ($portsNeeded >= $portsUsed) {
+	    $msg .= 'all ports';
+	}
+	else {
+	    $msg .= "$portsNeeded port";
+	    $msg .= 's' if $portsNeeded > 1;
+	}
+	$msg .= ' must be freed';
+
+	AdminNotice( $conf->name.$msg );
+
+	my $channel = $conf->{IRCChannel};
+	if ($channel && $channel->{Listening}) {
+	    my $channel_name = $channel->{NAME};
+	    Say( $channel->{CONN},
+		 $channel_name,
+		 "This conference is$msg" );
+	}
+	$conn->schedule(
+	    $interval,
+	    sub
+	    {
+		DisconnectLatestArrival( $conf );
+	    }
+	);
+    }
+    else {
+	$conn->schedule(
+	    $interval,
+	    sub
+	    {
+		ScheduleConfOvertimeCheck( $conf, $interval );
+	    }
+	);
+    }
+}
+
+# Search for the most recent arrival to a conference and disconnect them
+# if we still need ports for other reservations.  Continue to do this
+# every 15 seconds until we have freed enough ports.
+#
+# Inputs: conf
+
+sub DisconnectLatestArrival
+{
+    my ($conf) = @_;
+
+    print Timestamp(), 'DisconnectLatestArrival(', $conf->name, ")\n";
+
+    my $portsInUse = $Conference{$conf->id}->{partyCount};
+
+    my ($tm, $portsReserved, undef, undef) = Schedule::PortsReserved();
+    my ($unclaimed, undef, undef) = UnclaimedPorts();
+    $portsReserved -= $unclaimed;
+
+    my ($available, $idle) = Party::PortsAvailable();
+
+    return if $portsReserved + $portsInUse <= $available;
+
+    my $targetParty;
+    my $latestStartTime = 0;
+
+    $conf->enumerate(	# find the party who joined most recently
+	sub
+	{
+	    my ($party) = @_;
+	    if (defined $party->port && $party->startTime > $latestStartTime) {
+		$targetParty = $party;
+		$latestStartTime = $party->startTime;
+	    }
+	}
+    );
+
+    return unless $targetParty;
+
+    unless ($Enable_AutoBreakdown && $Enable_TerminationWarnings) {
+	print Timestamp(), 'AutoBreakdown disabled; would have disconnected ', $targetParty->name, "\n";
+	return;
+    }
+
+    my $msg = 'disconnecting '.$targetParty->name;
+    print Timestamp(), $msg, "\n";
+
+    my $conn = ($conf->{IRCChannel})
+	? $conf->{IRCChannel}->{CONN}
+	: $AdminChannel->{CONN};
+
+    my $channel = $conf->{IRCChannel};
+    if ($channel && $channel->{Listening}) {
+	my $channel_name = $channel->{NAME};
+	Say( $conn, $channel_name, $msg );
+    }
+    $targetParty->disconnect();
+    if ($portsReserved + $portsInUse - $available > 1) {
+	$conn->schedule( 15,
+			 sub
+			 {
+			     DisconnectLatestArrival( $conf );
+			 }
+		       );
+    }
+}
+
+# Returns the current time as a timestamp of the form yyyy-mm-ddThh:mm:ssZ
+sub Timestamp
+{
+    return strftime( '%Y-%m-%dT%H:%M:%SZ', gmtime );
+}
+
+
+# UnclaimedPorts
+#
+# Compute the reserved ports that have not been claimed:
+# For conferences that have been in progress at least 15 minutes and
+# that are scheduled to still be in progress as of the specified time,
+# compute the difference between the number of ports reserved and
+# the number of ports currently in use.  Return the sum of these
+# unused ports, leaving one additional port per conference.
+#
+# Inputs: time; current time will be used if undefined
+#
+# Returns: (totalUnclaimedPorts, totalUnclaimedPorts@t+30, totalUnclaimedPorts@t+60)
+#
+# note that the returned values can be less than zero if conferences
+# are using more than their reserved port allocation (e.g. by operator
+# intervention)
+
+sub UnclaimedPorts
+{
+    my ($checkTime) = @_;
+    $checkTime = time unless $checkTime;
+    my $totalUnclaimed = 0;
+    my $totalUnclaimed30 = 0;
+    my $totalUnclaimed60 = 0;
+    my $quarterHourAgo = time - 15*60;
+
+    Schedule::Enumerate(
+	sub
+	{
+	    my ($resv) = @_;
+	    # if a reservation is in place for a conference to have started
+	    # at least 15 minutes ago that should still be in progress, it
+	    # may have unclaimed ports available
+
+	    my $endTime = $resv->start + $resv->duration*60;
+	    if ( $resv->start &&
+		 $resv->start < $quarterHourAgo &&
+		 $endTime > $checkTime )
+	    {
+		my $found = 0;
+		foreach my $c (values %Conference) {
+		    unless (defined $c->{conf}) {
+			print '*** ',__LINE__,' undefined conf ', $c, "\n"; # @@ debugging
+			next;
+		    }
+
+		    if ($c->{active} && $c->{conf}->name() eq $resv->name) {
+			$found = 1;
+			my $unclaimed = $resv->ports - $c->{partyCount};
+			$unclaimed-- if $unclaimed > 0;
+			print Timestamp(), ' ', $resv->name, " has $unclaimed unclaimed ports\n"; # @@
+			$totalUnclaimed += $unclaimed;
+			$totalUnclaimed30 += $unclaimed unless $endTime < $checkTime+1800;
+			$totalUnclaimed60 += $unclaimed unless $endTime < $checkTime+3600;
+			last;
+		    }
+		}
+		unless ($found) {
+		    my $unclaimed = $resv->ports;
+		    print Timestamp(), ' ', $resv->name, " has $unclaimed unclaimed ports\n"; # @@
+		    $totalUnclaimed += $unclaimed;
+		    $totalUnclaimed30 += $unclaimed unless $endTime < $checkTime+1800;
+		    $totalUnclaimed60 += $unclaimed unless $endTime < $checkTime+3600;
+		}
+	    }
+	}
+    );
+
+    return ($totalUnclaimed, $totalUnclaimed30, $totalUnclaimed60);
+}
+
+# Acknowledge a speaker, modifying the speaker queue
+#
+# Input: speaker, channel
+#
+# Returns: queuedName, speakerNote
+
+sub AcknowledgeSpeaker
+{
+    my ($speaker, $channel) = @_;
+    my $speakerNote = undef;
+
+    my $queuedName = undef;
+    my $currentQueue = $channel->{SpeakerQueue};
+    if ($currentQueue) {
+	my $position = FindInArray( $currentQueue, $speaker );
+	if (defined $position) {
+	    $queuedName = @{$currentQueue}[$position];
+	    splice( @{$currentQueue}, $position, 1);
+	    my $currentNotes = $channel->{SpeakerNotes};
+	    $speakerNote = @{$currentNotes}[$position];
+	    splice( @{$currentNotes}, $position, 1);
+	}
+    }
+
+    if ($channel->{SpeakerTalkTime}) {
+	my $version;
+	if ($channel->{TalkTimerVersion}) {
+	    $version = ++$channel->{TalkTimerVersion};
+	}
+	else {
+	    $channel->{TalkTimerVersion} = $version = 1;
+	}
+	ResetTalkTimer($channel, $channel->{SpeakerTalkTime}, $version);
+    }
+    $channel->{LastAckdSpeaker} = $queuedName || $speaker; # ucfirst($queuedName || $speaker);
+
+    return ($queuedName, $speakerNote);
+}
+
+# Add a conference attendee to the list for a conference
+#
+# Input: Conference, partyName
+#
+# Returns: (nothing)
+
+sub AddAttendee
+{
+    my ($conference, $attendee) = @_;
+
+    my $attendeeList = $conference->{Attendees};
+
+    push( @{$attendeeList}, $attendee )
+	unless defined FindInArray( $attendeeList, $attendee, 1);
+}
+
+# Drop a conference attendee from the list for a conference
+#
+# Input: Conference, partyName
+#
+# Returns: (nothing)
+
+sub DropAttendee
+{
+    my ($conference, $attendee) = @_;
+
+    my $attendeeList = $conference->{Attendees};
+
+    my $position = FindInArray( $attendeeList, $attendee, 1);
+
+    $position = FindInArray( $attendeeList, "[$attendee]", 1)
+	if not defined $position;
+
+    splice( @{$attendeeList}, $position, 1 ) if defined $position;
+}
+
+
+# Handles subprocess output
+sub ProcessReaderHandler
+{
+    my ($closure) = @_;
+
+    my $conn = $closure->{conn};
+    my $channel_name = $closure->{channelN};
+    my $dest_nick = $closure->{dest_nick};
+    my $handle = $closure->{handle};
+
+    my $input = <$handle>;
+
+    unless (defined $input) {
+	$::IRC->removefh($handle);
+	close $handle;
+	Say( $conn, $dest_nick, $closure->{done_msg}, $closure->{addressed} );
+	print $closure->{done_msg}, "\n";
+	return;
+    }
+
+    chomp $input;
+    print "ProcessReader heard '",$input,"'\n";
+
+    if ($input =~ m/^cmd: (.*)$/) {
+	my $cmd = $1;
+	Say( $conn, $dest_nick, $cmd, $closure->{addressed} );
+	command_for_me($conn, $closure->{event}, $channel_name, $cmd,
+		       $closure->{is_private}, $closure->{addressed}, 1);
+    } elsif ($input =~ m/^cmdnoecho: (.*)$/) {
+	my $cmd = $1;
+	command_for_me($conn, $closure->{event}, $channel_name, $cmd,
+		       $closure->{is_private}, $closure->{addressed}, 1);
+    } elsif ($input =~ m/^echo: (.*)$/) {
+	my $cmd = $1;
+	Say( $conn, $dest_nick, $cmd, $closure->{addressed} );
+    }
+}
+
+__END__
+
+=pod
+
+=head1 NAME
+
+zakim - Teleconference bridge and meeting facilitator
+
+=head1 SYNOPSIS
+
+=head1 DESCRIPTION
+
+=head2 LICENSE
+
+GNU GPL version 2 or later - see http://www.gnu.org/copyleft/gpl.html
+
+=head2 AUTHOR
+
+Ralph R. Swick mailto:swick@mit.edu
+World Wide Web Consortium
+Massachusetts Institute of Technology
+
+with a greatly-appreciated head-start from 'logger' written by
+
+Dave Beckett - http://purl.org/net/dajobe/, 
+Institute for Learning and Research Technology, http://ilrt.org/,
+University of Bristol.
+
+=cut
