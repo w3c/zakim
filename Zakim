@@ -65,7 +65,6 @@ my %channelMeetingData;		# Meeting configuration data
 				# -> {meetingName}
 				# -> {loggerRequests} @ARRAY
 
-my $SetCallerName = 1;
 my %partyName;			# {id}->{party}
 
 				# Nicks have:
@@ -120,13 +119,6 @@ my $ReaperScheduled = 0;	# reap idle channels semaphore
 
 my $WhoisLog = undef;		# name for WHOIS logfile; not kept by default
 
-my $FileNamePattern = '%Y/%m/%d-<channel>-<type>'; # pattern for generating
-				# channel-unique URIs
-my $LocalRoot = undef;		# local filesystem root for Web space
-my $URIRoot = undef;		# URI root for Web space
-my $TestMode = undef;		# true to display system() commands,
-				# false to evaluate
-
 $::program=basename $0;
 
 $::Nick='bridge'; # OK this can be changed if clashes
@@ -166,8 +158,6 @@ $::Admin_LOG=undef;
 $::PID_File=undef;
 
 $::StatisticsEnabled = 0;	# hold statistics for irc display
-
-my $hidden_conf_codes;
 
 ######################################################################
 package URI::irc;
@@ -323,15 +313,13 @@ sub main {
 Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
   where option is one or more of:
    -agenda <file>   updates <file> with the list of meeting agendas
-   -bridge <host:port> identify CAS server
-   -nocallername    disables renaming of parties in bridge
    -confDescriptions <file> conference descriptions by channel
    -confURI <URI>   URI to which to append conference schedule IDs
    -html            write an XHTML log
    -loggerBot <nick>	irc nick of logger bot (default RRSAgent)
    -meetingData <file>	name of configuration file for Start/End Meeting
    -notext	    Do not write a text log
-   -trace	    enable debugging output
+   -irctrace	    enable debugging output
    -log <logfile>   Write logs to logfile rather than the default
                     of channel/YYYY-MM-DD
                     (\".txt\", \".html\", and \".rdf\" will be appended)
@@ -339,7 +327,8 @@ Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
 
    -noaction	    Do not log /me messages
    -noofftopic      Do not ignore lines starting with [off]
-   -userhosts       Record user\@host in /join messages
+   -userhost        Record user\@host in /join messages
+   -whoislog <log>  Log nick changes in specified log
 
   and channel-URI is like irc://host[:port]/channel
 EOT
@@ -349,25 +338,17 @@ EOT
   my(%do_log_types)=map {$_ => 1} @::DefaultLogTypes;
 
   my $log_name=undef;
-  my $bridge = "";
   die $usage unless GetOptions ('action!' => \$::LogActionMsgs,
 		       'agenda=s'=> \$AgendaFile,
-		       'bridge=s'=> \$bridge,
-		       'callername!' => \$SetCallerName,
 		       'confDescriptions=s' => \$channelConfDescriptionFile,
 		       'confURI=s'   => \$confURI,
-		       'fpattern=s'  => \$FileNamePattern,
-		       'hide=s'	 => \$hidden_conf_codes,
 		       'html!'	 => \$do_log_types{'html'},
 		       'irctrace!'  => \$IRCtrace,
 		       'loggerBot=s'  => \$LoggerBot,
-		       'lroot=s' => \$LocalRoot,
 		       'meetingData=s' => \$channelMeetingDataFile,
-		       'system!' => \$TestMode,
 		       'text!'	 => \$do_log_types{'txt'},
 		       'log=s'	 => \$log_name,
 		       'nick=s'	 => \$::Nick,
-		       'uroot=s' => \$URIRoot,
 		       'userhost!' => \$::LogUserHosts,
 		       'whoislog=s'=> \$WhoisLog,
 		       'offtopic!' => \$::OffTopic,
