@@ -49,10 +49,6 @@ use Socket;
 %ENV=();
 $ENV{PATH}='/bin:/usr/bin:/usr/local/bin';
 
-my $STX = v2;
-my $ETX = v3;
-
-
 my %channelConfDescription;	# persistent channel descriptions
 				# -> {confDescription}
 my $channelConfDescriptionFile;
@@ -69,12 +65,6 @@ my %channelMeetingData;		# Meeting configuration data
 				# -> {meetingName}
 				# -> {loggerRequests} @ARRAY
 
-my %Conference;			# {confID}->
-				# {conf} {active} {partyCount} {maxParties}
-				# {startTimeStr} {finishTimeStr} {startTime}
-				# {Attendees}->@
-				# {partyCountSerial}
-				# {adhocCode}
 my $SetCallerName = 1;
 my %partyName;			# {id}->{party}
 
@@ -137,11 +127,6 @@ my $URIRoot = undef;		# URI root for Web space
 my $TestMode = undef;		# true to display system() commands,
 				# false to evaluate
 
-# Global constants
-
-my $SOLITARY_WAIT_TIME = 300;	# Time in seconds after a conference ends
-				# before we disconnect a lone participant
-
 $::program=basename $0;
 
 $::Nick='bridge'; # OK this can be changed if clashes
@@ -183,12 +168,6 @@ $::PID_File=undef;
 $::StatisticsEnabled = 0;	# hold statistics for irc display
 
 my $hidden_conf_codes;
-
-my $Enable_AutoBreakdown = 1;
-
-my $Enable_TerminationWarnings = 1; # Monitor schedule and notify conferences
-				# when their reserved time is coming to and
-				# end and some ports must be freed
 
 ######################################################################
 package URI::irc;
@@ -339,31 +318,11 @@ sub removeConfFromChannel
     }
 }
 
-sub addConfToChannel($$;$)
-{
-    my ($conf, $channel, $who) = @_;
-    $channel->{BridgeConference} = $conf;
-    $channel->{ConferenceName} = $conf->name;
-    if (defined $conf->{IRCChannel}) {
-	my $oldchannel = $conf->{IRCChannel};
-	if ($oldchannel && $oldchannel->{Listening}) {
-	    my $channel_name = $oldchannel->{NAME};
-	    Say( $oldchannel->{CONN}, $channel_name, $conf->name.' has been moved to '.$channel->{NAME}.($who ? ' by '.$who : '') );
-	}
-	delete $oldchannel->{BridgeConference};
-	delete $oldchannel->{ConferenceName};
-    }
-    $conf->{IRCChannel} = $channel;
-    print $conf, ' (', $conf->name(), ') has irc channel ', $channel, ' (', $channel->{NAME}, ")\n";
-}
-
-
 sub main {
   my $usage=<<"EOT";
 Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
   where option is one or more of:
    -agenda <file>   updates <file> with the list of meeting agendas
-   -[no]autobreakdown  [don't] toss callers off when reserved time has elapsed
    -bridge <host:port> identify CAS server
    -nocallername    disables renaming of parties in bridge
    -confDescriptions <file> conference descriptions by channel
@@ -393,7 +352,6 @@ EOT
   my $bridge = "";
   die $usage unless GetOptions ('action!' => \$::LogActionMsgs,
 		       'agenda=s'=> \$AgendaFile,
-		       'autobreakdown!' => \$Enable_AutoBreakdown,
 		       'bridge=s'=> \$bridge,
 		       'callername!' => \$SetCallerName,
 		       'confDescriptions=s' => \$channelConfDescriptionFile,
@@ -406,7 +364,6 @@ EOT
 		       'lroot=s' => \$LocalRoot,
 		       'meetingData=s' => \$channelMeetingDataFile,
 		       'system!' => \$TestMode,
-		       'terminationwarnings!' => \$Enable_TerminationWarnings,
 		       'text!'	 => \$do_log_types{'txt'},
 		       'log=s'	 => \$log_name,
 		       'nick=s'	 => \$::Nick,
@@ -1125,22 +1082,12 @@ sub command_for_me ($$$$$$$) {
 
     # clear statistics
     if($command =~ /^(?:clear\s+stats|clear\s+statistics)$/i) {
-	foreach my $c (keys %Conference) {
-	    print '*** ',__LINE__,' undefined conf ', $c, "\n"	# @@ debugging
-		unless (defined $c->{conf});
-	    delete $Conference{$c} if ! $Conference{$c}->{active};
-	}
 	Say( $self, $dest_nick, "done, $from_nick", $first_person );
 	return;
     }
 
     # disable statistics
     if($command =~ /^(?:disable\s+stats|disable\s+statistics)$/i) {
-	foreach my $c (keys %Conference) {
-	    print '*** ',__LINE__,' undefined conf ', $c, "\n"	# @@ debugging
-		unless (defined $c->{conf});
-	    delete $Conference{$c} if ! $Conference{$c}->{active};
-	}
 	$::StatisticsEnabled = 0;
 	Say( $self, $dest_nick, "statistics will not be held, $from_nick", $first_person );
 	return;
@@ -1150,38 +1097,6 @@ sub command_for_me ($$$$$$$) {
     if($command =~ /^(?:enable\s+stats|enable\s+statistics)$/i) {
 	$::StatisticsEnabled = 1;
 	Say( $self, $dest_nick, "statistics will be held, $from_nick", $first_person );
-	return;
-    }
-
-    # disable autobreakdown
-    if($command =~ /^disable\s+autobreakdown$/i) {
-	my $msg = $Enable_AutoBreakdown ? 'is now' : 'was already';
-	$Enable_AutoBreakdown = 0;
-	Say( $self, $dest_nick, "AutoBreakdown $msg disabled, $from_nick", $first_person );
-	return;
-    }
-
-    # enable autobreakdown
-    if($command =~ /^enable\s+autobreakdown$/i) {
-	my $msg = $Enable_AutoBreakdown ? 'was already' : 'is now';
-	$Enable_AutoBreakdown = 1;
-	Say( $self, $dest_nick, "AutoBreakdown $msg enabled, $from_nick", $first_person );
-	return;
-    }
-
-    # disable termination warnings
-    if($command =~ /^disable\s+termination(\s+warnings)?$/i) {
-	my $msg = $Enable_TerminationWarnings ? 'are now' : 'were already';
-	$Enable_TerminationWarnings = 0;
-	Say( $self, $dest_nick, "Termination warnings $msg disabled, $from_nick", $first_person );
-	return;
-    }
-
-    # enable termination warnings
-    if($command =~ /^enable\s+termination(\s+warnings)?$/i) {
-	my $msg = $Enable_TerminationWarnings ? 'were already' : 'are now';
-	$Enable_TerminationWarnings = 1;
-	Say( $self, $dest_nick, "Termination warnings $msg enabled, $from_nick", $first_person );
 	return;
     }
 
@@ -1228,26 +1143,7 @@ sub command_for_me ($$$$$$$) {
 
   # statistics
   if($command =~ /^(?:stats|statistics)$/i) {
-      my $empty = 1;
-      foreach my $c (keys %Conference) {
-	  $empty = 0;
-	  my $maxP = $Conference{$c}->{maxParties};
-	  my $active = $Conference{$c}->{active};
-	  unless (defined $Conference{$c}->{conf}) {
-	      print '*** ',__LINE__,' undefined conf ', $c, "\n"; # @@ debugging
-	      next;
-	  }
-	  Say( $self,
-	       $dest_nick,
-	       $Conference{$c}->{conf}->name().($active? ' using ' : ' used ').$maxP." port".($maxP == 1 ? '' : 's').($active ? '' : " [ended on $Conference{$c}->{finishTimeStr}]"),
-	       $first_person );
-      }
-      if ($empty) {
-	  Say( $self, $dest_nick, "Sorry, $from_nick, no statistics yet", $first_person );
-      }
-      else {
-	  Say( $self, $dest_nick, "that's all, $from_nick", $first_person );
-      }
+      Say( $self, $dest_nick, "Sorry, $from_nick, no statistics yet", $first_person );
       return;
   }
 
@@ -1465,7 +1361,6 @@ sub command_for_me ($$$$$$$) {
 	  }
 
 	  $conf->{HasTransientParties} = 1;
-	  AddAttendee( $Conference{$conf->id}, $individual );
 #	  $ircUser->{party} = $party if $ircUser;
 	  Say( $self,
 	       $dest_nick,
@@ -1506,8 +1401,6 @@ sub command_for_me ($$$$$$$) {
 				   $nameFlags
 				  );
       if ($party) {
-	  DropAttendee( $Conference{$conf->id}, $searchname );
-	  AddAttendee( $Conference{$conf->id}, $newname );
 	  $party->{Holds} = undef if $command =~ /^(\S+)\s+is really/;
           Say( $self, $dest_nick, "+$newname; got it", $first_person );
       }
@@ -1521,9 +1414,7 @@ sub command_for_me ($$$$$$$) {
 	      my $msg = ($first_person ? 'I ' : '')
 		     .'already had ??P'.$1.' as '.$oldname.', '.$from_nick;
 	      if ($command =~ /^(\S+)\s+is really/) {
-		  DropAttendee( $Conference{$conf->id}, $oldname );
 		  $party->name($newname);
-		  AddAttendee( $Conference{$conf->id}, $newname );
 		  $party->{Holds} = undef;
 		  $msg = "+$newname; got it";
 	      }
@@ -1584,7 +1475,6 @@ sub command_for_me ($$$$$$$) {
 
       if ($party->{NameIsUnknown}) {
 	  RenameConfParty( $conf, $searchname, $newname, '' );
-	  AddAttendee( $Conference{$conf->id}, $newname );
 	  Say( $self, $dest_nick, "+$newname; got it", $first_person );
       }
       else {
@@ -1688,9 +1578,6 @@ sub command_for_me ($$$$$$$) {
 	  return;
       }
 
-      DropAttendee( $Conference{$conf->id}, $party->name )
-	  unless $also || $party->{Holds};
-
       $holds =~ s/, +/,/g;
       $holds =~ s/([^,]) +/$1,/g;
       my @names = split( /,/, $holds);
@@ -1708,7 +1595,6 @@ sub command_for_me ($$$$$$$) {
 		   $first_person );
 	      next;
 	  }
-	  AddAttendee( $Conference{$conf->id}, $name );
 	  $holds .= $sep.$name;
 	  $sep = ', ';
       }
@@ -1844,16 +1730,6 @@ sub command_for_me ($$$$$$$) {
   if($command =~ /^(?:please\s+|pls\s+)?(?:what\s+conferences(?:\s+are\s+active|\s+do\s+you\s+see)?\s*\?|list\s+conferences|list)$/i) {
       my $list = '';
       my $sep = '';
-      foreach my $c (values %Conference) {
-	  unless (defined $c->{conf}) {
-	      print '*** ',__LINE__,' undefined conf ', $c, "\n"; # @@ debugging
-	      next;
-	  }
-	  next if ! $c->{active};
-	  my $name = $c->{conf}->name();
-	  $list .= $sep.$name;
-	  $sep = ', ';
-      }
 
       # list scheduled conferences that have not already started
       my $scheduled = '';
@@ -1953,21 +1829,6 @@ sub command_for_me ($$$$$$$) {
 			  : "no, $from_nick, I'm not listening anywhere",
 		$first_person );
     Say( $self, $dest_nick, 'Idle mins:'.$idle, $first_person ) if $idle;
-    if ($where) {
-	for my $confID (keys %Conference) {
-	    unless (defined $Conference{$confID}->{conf}) {
-		print '*** ',__LINE__,' undefined conf ', $confID, "\n"; # @@ debugging
-		next;
-	    }
-	    if ($Conference{$confID}->{active}
-		&& $Conference{$confID}->{conf}->{IRCChannel}) {
-		my $channel = $Conference{$confID}->{conf}->{IRCChannel};
-		my $partycount = $Conference{$confID}->{partyCount};
-		my $plural = $partycount == 1 ? '' : 's';
-		Say( $self, $dest_nick, $channel->{NAME}.' has '.$Conference{$confID}->{conf}->name.' with '.$partycount.' participant'.$plural, $first_person );
-	    }
-	}
-    }
     return;
   }
 
@@ -4124,34 +3985,6 @@ sub ShowRemainingAgenda($$$$;$)
 	      ($agendumCount ? 'remaining ' : '').'on the agenda',
 	     $addressed
 	    );
-	if ($addressed
-	    && $channel->{ConferenceName}
-	    && $channel->{ConferenceName} =~ m/^Team_/) {
-
-	    my $conf = $channel->{BridgeConference};
-	    my $startTime = ($conf && $conf->id)
-		? $Conference{$conf->id}->{startTime}
-		: 0;
-
-	    my %eggs = (
-		'Team_MIT(site)'
-		    => {'topic' => 'spam', 'time' => 70},
-		'Team_Global(review)'
-		    => {'topic' => 'slide making tools', 'time' => 50},
-		'Team_Ralph'
-		    => {'topic' => 'testing', 'time' => 999}
-	    );
-	    for my $confName (keys %eggs) {
-		if ($channel->{ConferenceName} eq $confName) {
-		    Say( $self,
-			 $dest_nick,
-			 "... but you haven't talked enough about "
-			    .$eggs{$confName}->{topic},
-			 $addressed
-			) if time - $startTime < 60*$eggs{$confName}->{time};
-		}
-	    }
-	}
 	return;
     }
     my $remainingText = ':';
@@ -4584,8 +4417,6 @@ sub ClientHandler($)
 }
 
 
-my %channelConferenceDescriptions; # persistent channel->{ConfDescription}
-
 # GetChannelConfDescription
 # Looks up a pre-assigned conference description using the irc channel name.
 # If no pre-assigned code is found, returns undef
@@ -4856,424 +4687,10 @@ sub LeaveChannel($$$$)
     return;
 }
 
-# Schedule a warning notice when a conference reservation is due to end
-# if the ports are needed by other reservations
-#
-# Input:
-#	Conference
-#	force	(boolean) forces warning when time has been exceeded
-#	neede	number of ports that must be freed
-
-sub ScheduleConfEndNotice
-{
-    my ($conf, $force, $prevPortsNeeded) = @_;
-
-    my $remaining = $conf->endTime;
-    return unless $Conference{$conf->id}->{active} && ($remaining || $force);
-
-    my $portsUsed = $Conference{$conf->id}->{partyCount};
-    my ($available, $idle) = Party::PortsAvailable();
-
-    if ($remaining) {		# check to see if ports must be freed
-	my ($tm, $portsReserved, undef, undef) =
-	    Schedule::PortsReserved($remaining + 5);
-	my ($unclaimed, undef, undef) = UnclaimedPorts($remaining + 5);
-	$portsReserved -= $unclaimed;
-	$prevPortsNeeded = $portsUsed + $portsReserved - $available;
-    }
-    else {
-	$prevPortsNeeded = 0 unless defined $prevPortsNeeded;
-	$remaining = 0;
-    }
-
-    $remaining -= time;
-    $remaining = 0 if $remaining < 0;
-
-    my $nextWarn;
-
-    if ($remaining > 600) {		# more than 10 minutes left
-	$nextWarn = $remaining - 600;	# warn at 10 minutes to end
-    }
-    elsif ($remaining > 300) {		# at least 5 minutes left
-	$nextWarn = $remaining - 300;	# warn at 5 minutes to end
-    }
-    elsif ($remaining > 120) {		# at least 2 minutes left
-	$nextWarn = $remaining - 120;	# warn at 2 minutes to end
-    }
-    elsif ($remaining > 60) {		# at least 1 minute left
-	$nextWarn = $remaining - 60;	# warn at 1 minute to end
-    }
-    else {
-	$nextWarn = $remaining;
-    }
-
-    my $conn = ($conf->{IRCChannel})
-	? $conf->{IRCChannel}->{CONN}
-        : $AdminChannel->{CONN};
-
-    print Timestamp(), ' ', $conf->name, ": remaining = $remaining, nextWarn = $nextWarn, portsNeeded = $prevPortsNeeded\n";
-
-    if ($nextWarn > 0) {
-	$conn->schedule( $nextWarn,
-	    sub
-	    {
-		return unless $Conference{$conf->id}->{active};
-
-		my $end = $conf->endTime;
-		my $portsNeeded = $prevPortsNeeded;
-		my $portsUsed = $Conference{$conf->id}->{partyCount};
-
-		if ($end) { # check to see if ports must be freed
-		    my ($tm, $portsReserved, undef, undef) =
-			Schedule::PortsReserved($end + 5);
-		    my ($unclaimed, undef, undef) = UnclaimedPorts($end + 5);
-		    $portsReserved -= $unclaimed;
-		    my ($available, $idle) = Party::PortsAvailable();
-		    $portsNeeded = 
-			$portsUsed + $portsReserved - $available;
-		}
-
-		if ($portsNeeded > 0) {
-		    # Check that some conference actually does start soon
-		    # "soon" is +- 5 mins from the end of this conference
-		    my $nextConfStart = FindNextConfStart($end - 300);
-		    my $tm = localtime($nextConfStart); # @@
-		    print "next conference starts on $tm\n"; # @@
-		    $portsNeeded = 0 if ($nextConfStart > $end + 300);
-		}
-
-		if ($portsNeeded > 0) {
-		    my $remaining = $end ? ($end - time) : 0;
-		    $remaining = ($remaining > 0)
-			? int( ($remaining + 59)/60 )
-			: 0;
-		    my $msg = $remaining
-			? "in $remaining minute"
-			    .(($remaining > 1) ? 's' : '')
-			: 'now';
-		    if ($portsNeeded >= $portsUsed) {
-			$msg .= '; all ports';
-		    }
-		    else {
-			$msg .= "; $portsNeeded port";
-			$msg .= 's' if $portsNeeded > 1;
-		    }
-		    $msg .= ' must be freed';
-		    $msg .= ' immediately' unless $remaining;
-
-		    AdminNotice( $conf->name.' to end '.$msg );
-
-		    my $channel = $conf->{IRCChannel};
-		    if ($channel && $channel->{Listening}
-			&& $Enable_TerminationWarnings)
-		    {
-			my $channel_name = $channel->{NAME};
-			Say( $channel->{CONN},
-			     $channel_name,
-			     "This conference is scheduled to end $msg" );
-		    }
-		}
-		ScheduleConfEndNotice($conf, 1, $portsNeeded);
-	    }
-	);
-	return;
-    }
-
-    # else $nextWarn <= 0; reached end of time slot
-    if ($prevPortsNeeded > 0) {
-	# if we need the ports for a conference starting about now,
-	# then disconnect parties else let this conference run over
-
-	my $now = time;
-	my $nextConfStart = FindNextConfStart($now - 300);
-	if ($nextConfStart > $now + 300) {
-	    $prevPortsNeeded = 0;
-	    print "conference is permitted to run into overtime\n";
-	}
-    }
-
-    if ($prevPortsNeeded > 0) {
-	my $channel = $conf->{IRCChannel};
-	if ($channel && $channel->{Listening}
-	    && $Enable_TerminationWarnings)
-	{
-	    my $channel_name = $channel->{NAME};
-	    my $s = $prevPortsNeeded > 1 ? 's' : '';
-	    my $msg = $Enable_AutoBreakdown ? "; disconnecting the most recent arrival$s" : '';
-	    Say( $channel->{CONN},
-		 $channel_name,
-		 "The time reserved for this conference has been exceeded. $prevPortsNeeded port$s must be freed$msg" );
-	}
-	DisconnectLatestArrival( $conf );
-    }
-    else {			# do not need ports now, but check again later
-	ScheduleConfOvertimeCheck($conf, 300);
-    }
-}
-
-
-# Locate the starting time of the next conference after the specified time
-#
-# Inputs: time
-#
-# Returns: time or undef if no reservation found
-
-sub FindNextConfStart
-{
-    my ($start) = @_;
-    my $nextConfStart = 0xefffffff;
-
-    Schedule::Enumerate(
-	sub
-	{
-	    my ($resv) = @_;
-	    $nextConfStart = $resv->start
-		if ($resv->start > $start && $resv->start < $nextConfStart);
-	}
-    );
-    return ($nextConfStart < 0xefffffff) ? $nextConfStart : undef;
-}
-
-
-# Warn a conference in overtime if its ports are needed by another
-# reservation and disconnect ports if necessary.
-#
-# Inputs: (conf, interval)
-#	conf	 conference that is running overtime
-#	interval time in seconds until next check, or until ports
-#		 are disconnected if they are needed
-
-sub ScheduleConfOvertimeCheck
-{
-    my ($conf, $interval) = @_;
-
-    my $portsUsed = $Conference{$conf->id}->{partyCount};
-    my $active = $Conference{$conf->id}->{active};
-
-    print "** non-zero partyCount of $portsUsed for inactive conference ",
-    	$conf->name, "\n" if $portsUsed && ! $active;
-
-    return unless $active && $portsUsed;
-
-    my $conn = ($conf->{IRCChannel})
-	? $conf->{IRCChannel}->{CONN}
-	: $AdminChannel->{CONN};
-
-    my ($tm, $portsReserved, $ports30, $ports60) =
-	Schedule::PortsReserved( time + $interval );
-
-    my ($unclaimed, $unclaimed30, $unclaimed60) =
-	UnclaimedPorts( time + $interval );
-
-    print "reserved=($portsReserved, $ports30, $ports60) unclaimed=($unclaimed, $unclaimed30, $unclaimed60)\n"; # @@
-
-    $portsReserved -= $unclaimed;
-
-    my ($available, $idle) = Party::PortsAvailable();
-    my $portsNeeded = $portsUsed + $portsReserved - $available;
-
-    print Timestamp(),' OvertimeCheck(', $conf->name, "); need $portsNeeded\n";
-
-    if ($portsNeeded > 0) {
-	# if we need the ports for a conference starting about now,
-	# then disconnect parties else let this conference run over
-
-	my $now = time;
-	my $nextConfStart = FindNextConfStart($now - 300);
-	if ($nextConfStart > $now + 300) {
-	    $portsNeeded = 0;
-	    print "conference is permitted to continue in overtime\n";
-	}
-    }
-
-    unless ($conn) {
-	print 'Undefined connection at ', __LINE__, ' for ', $conf->name,
-	      "; $portsNeeded ports needed, irc channel is ",
-	      ($conf->{IRCChannel}) ? '' : 'not ', "defined\n";
-	return;
-    }
-
-    if ($portsNeeded > 0) {
-	my $msg = ' in overtime; ';
-	if ($portsNeeded >= $portsUsed) {
-	    $msg .= 'all ports';
-	}
-	else {
-	    $msg .= "$portsNeeded port";
-	    $msg .= 's' if $portsNeeded > 1;
-	}
-	$msg .= ' must be freed';
-
-	AdminNotice( $conf->name.$msg );
-
-	my $channel = $conf->{IRCChannel};
-	if ($channel && $channel->{Listening}) {
-	    my $channel_name = $channel->{NAME};
-	    Say( $channel->{CONN},
-		 $channel_name,
-		 "This conference is$msg" );
-	}
-	$conn->schedule(
-	    $interval,
-	    sub
-	    {
-		DisconnectLatestArrival( $conf );
-	    }
-	);
-    }
-    else {
-	$conn->schedule(
-	    $interval,
-	    sub
-	    {
-		ScheduleConfOvertimeCheck( $conf, $interval );
-	    }
-	);
-    }
-}
-
-# Search for the most recent arrival to a conference and disconnect them
-# if we still need ports for other reservations.  Continue to do this
-# every 15 seconds until we have freed enough ports.
-#
-# Inputs: conf
-
-sub DisconnectLatestArrival
-{
-    my ($conf) = @_;
-
-    print Timestamp(), 'DisconnectLatestArrival(', $conf->name, ")\n";
-
-    my $portsInUse = $Conference{$conf->id}->{partyCount};
-
-    my ($tm, $portsReserved, undef, undef) = Schedule::PortsReserved();
-    my ($unclaimed, undef, undef) = UnclaimedPorts();
-    $portsReserved -= $unclaimed;
-
-    my ($available, $idle) = Party::PortsAvailable();
-
-    return if $portsReserved + $portsInUse <= $available;
-
-    my $targetParty;
-    my $latestStartTime = 0;
-
-    $conf->enumerate(	# find the party who joined most recently
-	sub
-	{
-	    my ($party) = @_;
-	    if (defined $party->port && $party->startTime > $latestStartTime) {
-		$targetParty = $party;
-		$latestStartTime = $party->startTime;
-	    }
-	}
-    );
-
-    return unless $targetParty;
-
-    unless ($Enable_AutoBreakdown && $Enable_TerminationWarnings) {
-	print Timestamp(), 'AutoBreakdown disabled; would have disconnected ', $targetParty->name, "\n";
-	return;
-    }
-
-    my $msg = 'disconnecting '.$targetParty->name;
-    print Timestamp(), $msg, "\n";
-
-    my $conn = ($conf->{IRCChannel})
-	? $conf->{IRCChannel}->{CONN}
-	: $AdminChannel->{CONN};
-
-    my $channel = $conf->{IRCChannel};
-    if ($channel && $channel->{Listening}) {
-	my $channel_name = $channel->{NAME};
-	Say( $conn, $channel_name, $msg );
-    }
-    $targetParty->disconnect();
-    if ($portsReserved + $portsInUse - $available > 1) {
-	$conn->schedule( 15,
-			 sub
-			 {
-			     DisconnectLatestArrival( $conf );
-			 }
-		       );
-    }
-}
-
 # Returns the current time as a timestamp of the form yyyy-mm-ddThh:mm:ssZ
 sub Timestamp
 {
     return strftime( '%Y-%m-%dT%H:%M:%SZ', gmtime );
-}
-
-
-# UnclaimedPorts
-#
-# Compute the reserved ports that have not been claimed:
-# For conferences that have been in progress at least 15 minutes and
-# that are scheduled to still be in progress as of the specified time,
-# compute the difference between the number of ports reserved and
-# the number of ports currently in use.  Return the sum of these
-# unused ports, leaving one additional port per conference.
-#
-# Inputs: time; current time will be used if undefined
-#
-# Returns: (totalUnclaimedPorts, totalUnclaimedPorts@t+30, totalUnclaimedPorts@t+60)
-#
-# note that the returned values can be less than zero if conferences
-# are using more than their reserved port allocation (e.g. by operator
-# intervention)
-
-sub UnclaimedPorts
-{
-    my ($checkTime) = @_;
-    $checkTime = time unless $checkTime;
-    my $totalUnclaimed = 0;
-    my $totalUnclaimed30 = 0;
-    my $totalUnclaimed60 = 0;
-    my $quarterHourAgo = time - 15*60;
-
-    Schedule::Enumerate(
-	sub
-	{
-	    my ($resv) = @_;
-	    # if a reservation is in place for a conference to have started
-	    # at least 15 minutes ago that should still be in progress, it
-	    # may have unclaimed ports available
-
-	    my $endTime = $resv->start + $resv->duration*60;
-	    if ( $resv->start &&
-		 $resv->start < $quarterHourAgo &&
-		 $endTime > $checkTime )
-	    {
-		my $found = 0;
-		foreach my $c (values %Conference) {
-		    unless (defined $c->{conf}) {
-			print '*** ',__LINE__,' undefined conf ', $c, "\n"; # @@ debugging
-			next;
-		    }
-
-		    if ($c->{active} && $c->{conf}->name() eq $resv->name) {
-			$found = 1;
-			my $unclaimed = $resv->ports - $c->{partyCount};
-			$unclaimed-- if $unclaimed > 0;
-			print Timestamp(), ' ', $resv->name, " has $unclaimed unclaimed ports\n"; # @@
-			$totalUnclaimed += $unclaimed;
-			$totalUnclaimed30 += $unclaimed unless $endTime < $checkTime+1800;
-			$totalUnclaimed60 += $unclaimed unless $endTime < $checkTime+3600;
-			last;
-		    }
-		}
-		unless ($found) {
-		    my $unclaimed = $resv->ports;
-		    print Timestamp(), ' ', $resv->name, " has $unclaimed unclaimed ports\n"; # @@
-		    $totalUnclaimed += $unclaimed;
-		    $totalUnclaimed30 += $unclaimed unless $endTime < $checkTime+1800;
-		    $totalUnclaimed60 += $unclaimed unless $endTime < $checkTime+3600;
-		}
-	    }
-	}
-    );
-
-    return ($totalUnclaimed, $totalUnclaimed30, $totalUnclaimed60);
 }
 
 # Acknowledge a speaker, modifying the speaker queue
@@ -5314,43 +4731,6 @@ sub AcknowledgeSpeaker
 
     return ($queuedName, $speakerNote);
 }
-
-# Add a conference attendee to the list for a conference
-#
-# Input: Conference, partyName
-#
-# Returns: (nothing)
-
-sub AddAttendee
-{
-    my ($conference, $attendee) = @_;
-
-    my $attendeeList = $conference->{Attendees};
-
-    push( @{$attendeeList}, $attendee )
-	unless defined FindInArray( $attendeeList, $attendee, 1);
-}
-
-# Drop a conference attendee from the list for a conference
-#
-# Input: Conference, partyName
-#
-# Returns: (nothing)
-
-sub DropAttendee
-{
-    my ($conference, $attendee) = @_;
-
-    my $attendeeList = $conference->{Attendees};
-
-    my $position = FindInArray( $attendeeList, $attendee, 1);
-
-    $position = FindInArray( $attendeeList, "[$attendee]", 1)
-	if not defined $position;
-
-    splice( @{$attendeeList}, $position, 1 ) if defined $position;
-}
-
 
 # Handles subprocess output
 sub ProcessReaderHandler
