@@ -511,8 +511,6 @@ sub Channel_join($) {
     unless $conn;
 
   $self->{CONN}=$conn;
-  
-  Channel_open_logs($self);
 
   $conn->debug(1) if $IRCtrace;
 
