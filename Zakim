@@ -121,8 +121,8 @@ my $WhoisLog = undef;		# name for WHOIS logfile; not kept by default
 
 $::program=basename $0;
 
-$::Nick='bridge'; # OK this can be changed if clashes
-$::IRC_Name='Bridge daemon';
+$::Nick='Zakim'; # OK this can be changed if clashes
+$::IRC_Name='Zakim IRC bot';
 
 $::LogActionMsgs=1;
 $::LogUserHosts=0;
@@ -1696,61 +1696,6 @@ sub command_for_me ($$$$$$$) {
       return;
   }
 
-  # caution: this regex must not match 'drop agendum nnn' or 'drop agenda nnn'
-  # please drop xxxx
-  if($command =~ /^(?:please\s+|pls\s+)?(?:disconnect|drop|hangup)\s+(\S+)$/i) {
-      my $searchname = $1;
-
-      Say( $self, $dest_nick, "sorry, $from_nick, I can't do that anymore", $first_person );
-      return;
-  }
-
-  # please list conferences
-  if($command =~ /^(?:please\s+|pls\s+)?(?:what\s+conferences(?:\s+are\s+active|\s+do\s+you\s+see)?\s*\?|list\s+conferences|list)$/i) {
-      my $list = '';
-      my $sep = '';
-
-      # list scheduled conferences that have not already started
-      my $scheduled = '';
-      $sep = '';
-      my $now = time;
-      my $is_are = 'is';
-
-      Schedule::Enumerate(
-	  sub
-	  {
-	      my ($resv) = @_;
-	      # if a reservation is in place for now or start in the next 15
-	      # minutes and has not already started, list it
-	      my $name = $resv->name;
-	      if ( $resv->start < ($now + 900) &&
-		   ($resv->start + $resv->duration*60) > $now &&
-		   $list !~ /\Q$name\E/ ) {
-		  $scheduled .= $sep.$name;
-		  $is_are = 'are' if $sep;
-		  $sep = ', ';
-	      }
-	  }
-      );
-
-      my $also = $list ? 'also ' : '';
-      my $others = ($list || $scheduled) ? 'no others' : 'none';
-
-      Say( $self,
-	   $dest_nick,
-	   ($first_person ? 'I see ' : 'sees ')
-		.($list ? "$list active" : 'no active conferences')
-		.($scheduled ? '' : " and $others scheduled to start in the next 15 minutes"),
-	   $first_person );
-
-      Say( $self,
-	   $dest_nick,
-	   ($first_person ? "${also}scheduled at this time $is_are " : 'sees in schedule ').$scheduled,
-	   $first_person ) if $scheduled;
-
-      return;
-  }
-
   # this conference will be xxxx
   if($command =~ /^(?:this\s+will\s+be|this\s+conference\s+will\s+be)\s+(.+)$/i) {
     my $searchname = $1;
@@ -2004,11 +1949,6 @@ sub command_for_me ($$$$$$$) {
       return;
   }
 
-  if($command =~ /\sgo\s+home\??$/i) {
-      Say( $self, $dest_nick, "You can go home any time you like, $from_nick" );
-      return;
-  }
-
   # [please] join <channel> [<password>]
   if ($command =~ m/^(?:please\s+|pls\s+)?join\s+(\S*)\s*(\S*)$/) {
       my $channel_name = $1;
@@ -2104,7 +2044,7 @@ sub command_for_me ($$$$$$$) {
       ' xxx holds yyy [, zzz ...] - establish xxx as a group name and yyy, etc. as participants within that group',
       ' xxx also holds yyy - add yyy to the list of participants in group xxx',
       " who's here?      - lists the participants on the phone",
-      ' is xxx here?     - reports whether a party named like xxx is present',      ' list conferences - reports the active conferences',
+      ' is xxx here?     - reports whether a party named like xxx is present',
       ' this is xxx      - associates this channel with conference xxx',
       ' excuse us        - disconnects from the irc channel',
     );
@@ -4343,59 +4283,6 @@ sub InList($$)
 }
 
 
-sub ClientHandler($)
-{
-    my ($conn) = @_;
-
-    my $sock = $conn->{socket};
-    my $port = $conn->{port};
-    my $msg;
-
-    print "ClientHander: port $port\n";
-
-    unless (defined $sock->recv($msg, 2048)) {
-	print 'recv error from ', $conn->{peername}, ' [', $conn->{peerIP},
-	      '] on port ', $conn->{port};
-	if ($sock->peername()) {
-	    print "; closing socket\n";
-	}
-	else {
-	    print "; peer disconnected\n";
-	}
-	$::IRC->removefh($sock);
-	$sock->close;
-	$conn->{closer}() if ($conn->{closer});
-	return;
-    }
-
-    print 'recv: from ', $conn->{peername}, ' [', $conn->{peerIP}, "] on port $port\n";
-
-    print 'ClientHandler heard: ', $msg, "\n";
-    ($msg, my @queue) = split('\n', $msg);
-
-    unless ($msg) {		# empty message
-	print "no msg; closing client\n";
-	$::IRC->removefh($sock);
-	$sock->close;
-	$conn->{closer}() if ($conn->{closer});
-	return;
-    }
-
-    do {
-	my $m = $msg;
-	if ($conn->{handler}) {
-	    $conn->{handler}($conn, $msg);
-	}
-	else {
-	    print "Unknown initialization\n";
-	    $::IRC->removefh($sock);
-	    $sock->close;
-	}
-	$msg = shift(@queue);
-    } while $msg;
-}
-
-
 # GetChannelConfDescription
 # Looks up a pre-assigned conference description using the irc channel name.
 # If no pre-assigned code is found, returns undef
@@ -4755,7 +4642,7 @@ __END__
 
 =head1 NAME
 
-zakim - Teleconference bridge and meeting facilitator
+zakim - IRC bot meeting facilitator
 
 =head1 SYNOPSIS
 
