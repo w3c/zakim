@@ -2033,9 +2033,6 @@ sub FindConfParty
     }
     return ($foundParty, 0) if $foundParty; # found an unambiguous match
 
-    # if still not found try the "[name]" variant
-    return FindConfParty($conf, "[$searchname]") unless $searchname =~ m/^\[/;
-
     return (undef, 0);
 }
 
@@ -2045,24 +2042,18 @@ sub FindConfParty
 sub UniquePartyName
 {
     my ($conf, $name) = @_;
-    my $isGroup = 0;
 
     my ($party, $ambig) = FindConfParty( $conf, $name );
 
     if ($party) {
-	if ($name =~ /^\[(.*)\]$/) {
-	    $name = $1;
-	    $isGroup = 1;
-	}
 	my $suffix = 'a';
 	$name .= '.';
 	while ($party) {
 	    $name .= $suffix;
-	    ($party, $ambig) = FindConfParty( $conf,
-					      $isGroup ? "[$name]" : $name );
+	    ($party, $ambig) = FindConfParty( $conf, $name );
 	}
     }
-    return $isGroup ? "[$name]" : $name;
+    return $name;
 }
 
 
