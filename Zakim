@@ -73,11 +73,10 @@ my %partyName;			# {id}->{party}
 
 				# parties have:
 				# {NameIsUnknown} {NameIsUnsure}
-				# {ArrivalTime} {IRC_user} {Holds}
+				# {ArrivalTime} {IRC_user}
 
 				# confs have:
 				# {IRCChannel}
-				# {HasTransientParties}
 
 				# channels have:
 				# {BridgeConference} {ConferenceName}
@@ -1168,14 +1167,6 @@ sub command_for_me ($$$$$$$) {
 		  $sepElse = ', ';
 	      }
 	  }
-	  else {
-	      if (defined $conf
-		  && $party->conf == $conf
-		  && (my $p = InList($query, $party->{Holds}))) {
-		  $partyElsewhere .= $sepElse.$p.' listed in '.$party->name;
-		  $sepElse = ', ';
-	      }
-	  }
       }
       Say( $self,
 	   $dest_nick,
@@ -1244,111 +1235,6 @@ sub command_for_me ($$$$$$$) {
       return;
   }
 
-  # This test must be performed prior to the 'xxx has yyy' test
-  # and prior to the 'is yyy' test
-  # xxx has just arrived in yyy
-  # xxx has just entered yyy
-  # I have just arrived in yyy
-  # xxx is in yyy
-  # xxx is with yyy
-
-  if($command =~ /^(\S+)\s+(?:has\s+|have\s+)?(?:just\s+)?(?:arrived\s+in|entered)\s+(\S+)\s*\??$/i ||
-     $command =~ /^(\S+)(?:\s+is|'s)\s+(?:in|with)\s+(\S+)\s*\??$/i ||
-     $command =~ /^(i)(?:\s+am|'m)\s+with\s+(\S+)$/i) {
-      my $individual = $1;
-      my $searchname = $2;
-#     my $ircUser;
-      my $party;
-      my $ambig;
-
-      my $isquery = ($searchname =~ s/\?$// || $command =~ m/\?$/);
-
-      if ($individual eq 'who' && !$isquery) {
-	  Say( $self,
-	       $dest_nick,
-	       "$from_nick, please add '?' if you meant to ask a question",
-	       $first_person
-	      );
-	  return;
-      }
-
-      if ($searchname =~ m/^(?:me|us|i)$/i) {
-	  my $fromUser = IRCuser::find($from_nick);
-	  $party = $fromUser->{party} if $fromUser;
-#	  $ircUser = IRCuser::find($name);
-
-	  if (lc($searchname) eq 'us') {
-	      unless ($party) {
-		  Say( $self,
-		       $dest_nick,
-		       "I do not know where you are, $from_nick",
-		       $first_person );
-		  return;
-	      }
-	      $searchname = $party->name;
-	  } else {
-	      $searchname = $from_nick;
-	  }
-      }
-
-      my $conf = $channel->{BridgeConference};
-      ($party, $ambig) = FindConfParty( $conf, $searchname ) unless $party;
-
-      unless ($party) {
-	  Say( $self,
-	       $dest_nick,
-	       $ambig ? "'$searchname' is ambiguous, $from_nick"
-		      : "sorry, $from_nick, I do not recognize a party named '$searchname'",
-	       $first_person );
-	  return;
-      }
-
-      if ($individual =~ /^(?:me|i)$/i) {
-	  $individual = $from_nick;
-#	  $ircUser = IRCuser::find($individual);
-      }
-
-      # $individual = ucfirst($individual);
-      if ($isquery) {
-	  my $name = $party->name;
-	  $name =~ s/\?$// if defined $party->{NameIsUnsure};
-	  my $holds = $party->{Holds};
-	  if (defined $holds) {
-	      $holds = 'no one' unless $holds;
-	  }
-	  else {
-	      $holds = 'only '.$name;
-	  }
-	  Say( $self, $dest_nick, "$name has $holds", $first_person );
-      }
-      else {
-	  if (my $i = InList($individual, $party->{Holds})) {
-	      Say( $self,
-		   $dest_nick,
-		   $i.' was already listed in '.$party->name.', '.$from_nick,
-		   $first_person );
-	      return;
-	  }
-
-	  if ($command =~ /^(\S+)(?:\s+is|'s)\s+with\s+(\S+)\s*\??$/i) {
-	      # include the original party if this is the first time
-	      my $was = $party->{Holds} || $party->name;
-	      $party->{Holds} = $was.', '.$individual;
-	  } else {
-	      my $sep = $party->{Holds} ? ', ' : '';
-	      $party->{Holds} .= $sep.$individual;
-	  }
-
-	  $conf->{HasTransientParties} = 1;
-#	  $ircUser->{party} = $party if $ircUser;
-	  Say( $self,
-	       $dest_nick,
-	       "+$individual; got it",
-	       $first_person );
-      }
-      return;
-  }
-
   # All commands of the form 'xxx is ...' that are not renaming a participant
   # must be tested before this point.
 
@@ -1380,7 +1266,6 @@ sub command_for_me ($$$$$$$) {
 				   $nameFlags
 				  );
       if ($party) {
-	  $party->{Holds} = undef if $command =~ /^(\S+)\s+is really/;
           Say( $self, $dest_nick, "+$newname; got it", $first_person );
       }
       else {
@@ -1394,7 +1279,6 @@ sub command_for_me ($$$$$$$) {
 		     .'already had ??P'.$1.' as '.$oldname.', '.$from_nick;
 	      if ($command =~ /^(\S+)\s+is really/) {
 		  $party->name($newname);
-		  $party->{Holds} = undef;
 		  $msg = "+$newname; got it";
 	      }
 	      Say( $self,
@@ -1470,42 +1354,6 @@ sub command_for_me ($$$$$$$) {
   }
 
   # This test must be performed prior to the 'xxx has yyy' test
-  # xxxx has just left yyyy
-  # I have just left yyyy
-  if($command =~ /^(\S+)\s+(?:has\s+|have\s+)?(?:just\s+)?(?:left|departed)\s+(\S+)$/i) {
-      my $individual = $1;
-      my $searchname = $2;
-      if ($individual =~ /^(?:me|i)$/i) { $individual = $from_nick }
-      # $individual = ucfirst($individual);
-      my $conf = $channel->{BridgeConference};
-      my $msg;
-      my ($party, $ambig) = FindConfParty( $conf, $searchname );
-
-      if ($party) {
-	  if (defined $party->{Holds}) {
-	      if (my $i = InList($individual, $party->{Holds})) {
-		  $party->{Holds} =~ s/(?:,\s*)?\Q$i\E//i;
-		  $msg = "-$i; got it";
-	      }
-	      else {
-		  $msg = "$from_nick, I was not aware that $individual was in $searchname";
-	      }
-	      $party->{Holds} =~ s/^,\s+//;
-	  }
-	  else {
-	      $msg = "$from_nick, I was not aware that anyone was in $searchname";
-	  }
-      }
-      Say( $self,
-	   $dest_nick,
-	   $party ? $msg
-		  : $ambig ? "'$searchname' is ambiguous, $from_nick"
-			   : "sorry, $from_nick, I do not recognize a party named '$searchname'",
-	   $first_person );
-      return;
-  }
-
-  # This test must be performed prior to the 'xxx has yyy' test
   # please close the queue, please [re]open the queue
   # please give xxx the last word
   # xxx has the last word
@@ -1534,164 +1382,6 @@ sub command_for_me ($$$$$$$) {
 
       Say( $self, $dest_nick, "$queuedName, you wanted to $speakerNote", 1 )
 	  if $speakerNote;
-
-      return;
-  }
-
-  # xxxx also holds yyyy
-  # xxxx also has yyyy
-  # xxxx holds yyyy, xxxx has yyyy
-  if($command =~ /^(\S+)\s+(?:now\s+|)(?:also\s+|)(?:contains|has|holds)\s+(.+)$/i) {
-      my $searchname = $1;
-      my $holds = $2;
-      my $also = ($command =~ /^\S+\s+(?:now\s+|)also\s+/i);
-
-      my $conf = $channel->{BridgeConference};
-      my ($party, $ambig) = FindConfParty( $conf, $searchname );
-      unless ($party) {
-	  Say( $self,
-	       $dest_nick,
-	       $ambig ? "'$searchname' is ambiguous, $from_nick"
-		      : "sorry, $from_nick, I do not recognize a party named '$searchname'",
-	       $first_person );
-	  return;
-      }
-
-      $holds =~ s/, +/,/g;
-      $holds =~ s/([^,]) +/$1,/g;
-      my @names = split( /,/, $holds);
-      $holds = '';
-      my $sep = '';
-
-      foreach my $name (@names) {
-	  next if $name eq 'and';
-	  $name = $from_nick if ($name =~ m/^(?:me|i)$/i);
-	  # $name = ucfirst($name);
-	  if (my $n = InList($name, $party->{Holds})) {
-	      Say( $self,
-		   $dest_nick,
-		   "$n was already listed in ".$party->name.", $from_nick",
-		   $first_person );
-	      next;
-	  }
-	  $holds .= $sep.$name;
-	  $sep = ', ';
-      }
-      if ($holds) {
-	  if ($also) {
-	      my $was = $party->{Holds} || $party->name;
-	      $party->{Holds} = $was.', '.$holds;
-	  }
-	  else {
-	      $party->{Holds} = $holds;
-	  }
-	  $conf->{HasTransientParties} = 1;
-	  Say( $self,
-	       $dest_nick,
-	       "+$holds; got it",
-	       $first_person );
-      }
-      return;
-  }
-
-  # xxxx no longer holds yyyy
-  if($command =~ /^(\S+)\s+no\s+longer\s+(?:contains|has|holds)\s+(.+)$/i) {
-      my $searchname = $1;
-      my $holds = $2;
-
-      my $conf = $channel->{BridgeConference};
-      my ($party, $ambig) = FindConfParty( $conf, $searchname );
-      unless ($party) {
-	  Say( $self,
-	       $dest_nick,
-	       $ambig ? "'$searchname' is ambiguous, $from_nick"
-		      : "sorry, $from_nick, I do not recognize a party named '$searchname'",
-	       $first_person );
-	  return;
-      }
-
-      $holds =~ s/, +/,/g;
-      $holds =~ s/([^,]) +/$1,/g;
-      my @names = split( /,/, $holds);
-      $holds = '';
-      my $sep = '';
-
-      foreach my $name (@names) {
-	  next if $name eq 'and';
-	  if ($name =~ m/^(?:me|i)$/i) {
-	      $name = $from_nick;
-#	      my $ircUser = IRCuser::find($name);
-#	      delete $ircUser->{party} if $ircUser;
-	  }
-
-	  # $name = ucfirst($name);
-	  if (my $n = InList($name, $party->{Holds})) {
-	      $name = $n;
-	      $party->{Holds} =~ s/(?:^|,\s*)\Q$name\E(?:,|$)/,/i;
-	  }
-	  else {
-	      Say( $self,
-		   $dest_nick,
-		   "$name was not listed in ".$party->name.", $from_nick",
-		   $first_person );
-	  }
-	  $holds .= $sep.$name;
-	  $sep = ', ';
-      }
-      if ($holds) {
-	  $party->{Holds} =~ s/^[, ]*//;
-	  $party->{Holds} =~ s/[, ]*$//;
-	  $conf->{HasTransientParties} = 1;
-	  Say( $self,
-	       $dest_nick,
-	       "-$holds; got it",
-	       $first_person );
-      }
-      return;
-  }
-
-  # xxxx is no longer with yyyy
-  # xxxx no longer is with yyyy
-  # xxxx is no longer in yyyy
-  # I am no longer in yyyy
-  if($command =~ /^(\S+)\s+(?:is\s+|am\s+|)no\s+longer\s+(?:is\s+|)(?:with|in)\s+(\S+)$/i) {
-      my $searchname = $2;
-      my $name = $1;
-
-      my $conf = $channel->{BridgeConference};
-      my ($party, $ambig) = FindConfParty( $conf, $searchname );
-      unless ($party) {
-	  Say( $self,
-	       $dest_nick,
-	       $ambig ? "'$searchname' is ambiguous, $from_nick"
-		      : "sorry, $from_nick, I do not recognize a party named '$searchname'",
-	       $first_person );
-	  return;
-      }
-
-      if ($name =~ m/^(?:me|i)$/i) {
-	  $name = $from_nick;
-#	  my $ircUser = IRCuser::find($name);
-#	  delete $ircUser->{party} if $ircUser;
-      }
-      # $name = ucfirst($name);
-      if (my $n = InList($name, $party->{Holds})) {
-	  $name = $n;
-	  $party->{Holds} =~ s/(?:^|,\s*)\Q$name\E(?:,|$)/,/i;
-	  $party->{Holds} =~ s/^[, ]*//;
-	  $party->{Holds} =~ s/[, ]*$//;
-	  $conf->{HasTransientParties} = 1;
-	  Say( $self,
-	       $dest_nick,
-	       "-$name; got it",
-	       $first_person );
-      }
-      else {
-	  Say( $self,
-	       $dest_nick,
-	       "$name was not listed in ".$party->name.", $from_nick",
-	       $first_person );
-      }
 
       return;
   }
@@ -2041,8 +1731,6 @@ sub command_for_me ($$$$$$$) {
       "                    if yyy is 'me' or 'I', your nick is substituted",
       ' xxx may be yyy   - establish yyy as possibly the name of unknown party xxx',
       ' I am xxx         - establish your nick as the name of unknown party xxx',
-      ' xxx holds yyy [, zzz ...] - establish xxx as a group name and yyy, etc. as participants within that group',
-      ' xxx also holds yyy - add yyy to the list of participants in group xxx',
       " who's here?      - lists the participants on the phone",
       ' is xxx here?     - reports whether a party named like xxx is present',
       ' this is xxx      - associates this channel with conference xxx',
@@ -4270,16 +3958,6 @@ sub NameFromNick
     }
 
     return $name;
-}
-
-
-# Searches a comma-separated text list for a word, ignoring case
-# returns the word if present else the empty string.
-sub InList($$)
-{
-    my ($word, $list) = @_;
-    return 0 unless $list;
-    return ($list =~ m/(?:^|,\s*)(\Q$word\E)(?:,|$)/i) ? $1 : '';
 }
 
 
