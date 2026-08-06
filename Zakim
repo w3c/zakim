@@ -1078,22 +1078,6 @@ sub command_for_me ($$$$$$$) {
 	return;
     }
 
-    # set leapday
-    if($command =~ /^set\s+leap(day)?$/i) {
-	my $msg = $::LeapDayFix ? 'was already' : 'is now';
-	$::LeapDayFix = 1;
-	Say( $self, $dest_nick, "Leap Day $msg in effect, $from_nick", $first_person );
-	return;
-    }
-
-    # clear leapday
-    if($command =~ /^clear\s+leap(day)?$/i) {
-	my $msg = $::LeapDayFix ? 'is no longer' : 'was not';
-	$::LeapDayFix = 0;
-	Say( $self, $dest_nick, "Leap Day $msg in effect, $from_nick", $first_person );
-	return;
-    }
-
   }
 
   # please excuse us
