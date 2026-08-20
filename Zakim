@@ -49,11 +49,6 @@ use Socket;
 %ENV=();
 $ENV{PATH}='/bin:/usr/bin:/usr/local/bin';
 
-my %channelConfDescription;	# persistent channel descriptions
-				# -> {confDescription}
-my $channelConfDescriptionFile;
-my $lastChannelConfDescriptionModTime = 0;
-
 my $LoggerBot = "RRSAgent";
 
 my $channelMeetingDataFile = "MeetingData";
@@ -91,7 +86,6 @@ my %partyName;			# {id}->{party}
 				# {LastAckdSpeaker}
 				# {NamesRequested}
 				# {NicksPresent}
-				# {ConfDescription}
 				# {Attendees}
 				# {Present}
 				# {Questions} {QuestionSyntaxReminder}
@@ -299,7 +293,6 @@ sub main {
   my $usage=<<"EOT";
 Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
   where option is one or more of:
-   -confDescriptions <file> conference descriptions by channel
    -loggerBot <nick>	irc nick of logger bot (default RRSAgent)
    -meetingData <file>	name of configuration file for Start/End Meeting
    -irctrace	    enable debugging output
@@ -313,8 +306,7 @@ EOT
 
   STDOUT->autoflush(1);
 
-  die $usage unless GetOptions ('confDescriptions=s' => \$channelConfDescriptionFile,
-		       'irctrace!'  => \$IRCtrace,
+  die $usage unless GetOptions ('irctrace!'  => \$IRCtrace,
 		       'loggerBot=s'  => \$LoggerBot,
 		       'meetingData=s' => \$channelMeetingDataFile,
 		       'nick=s'	 => \$::Nick,
@@ -1114,30 +1106,12 @@ sub command_for_me ($$$$$$$) {
 
   # this is xxx
   # this conference is xxx
-  # now that 'really' is optional in 'xxx is yyy', this test must come first
-  # this conference is xxxx
-  # move xxx to here
-  # move xxx to this channel
-  if($command =~ /^(?:this\s+is|this\s+conference\s+is)\s+(.+)$/i ||
-     $command =~ /^move\s+(\S+)\s+to\s+(?:here|this\s+channel)$/i) {
-    my $searchname = $1;
-
-    $channel->{ConfDescription} = $1;
-
-    Say( $self, $dest_nick, "got it, $from_nick", $first_person );
+  # this conference will be xxxx
+  # (deprecated; this code kept to assist people trying to set the meeting title)
+  if($command =~ /^(?:this\s+(?:is|will be)|this\s+conference\s+(?:is|will be))\s+(.+)$/i) {
+    my $title = $1;
+    Say( $self, $dest_nick, qq{to set the meeting title please use "meeting: $title", $from_nick}, $first_person );
     return;
-  }
-
-  # save this conference description
-  if($command=~ /^(?:please\s+|pls\s+|)save\s+(this\s+)?(conference\s+)?description(?:\s+(\S+)|)$/i) {
-      if (not defined $channel->{ConfDescription}) {
-	  Say( $self, $dest_nick, "sorry, I have not been told a conference description for this channel, $from_nick", $first_person );
-	  return;
-      }
-
-      SaveChannelConfDescriptionFile($channel);
-      Say( $self, $dest_nick, "this conference description has been saved, $from_nick", $first_person );
-      return;
   }
 
   # All commands of the form 'xxx is ...' that are not renaming a participant
@@ -1288,48 +1262,6 @@ sub command_for_me ($$$$$$$) {
       Say( $self, $dest_nick, "$queuedName, you wanted to $speakerNote", 1 )
 	  if $speakerNote;
 
-      return;
-  }
-
-  # this conference will be xxxx
-  if($command =~ /^(?:this\s+will\s+be|this\s+conference\s+will\s+be)\s+(.+)$/i) {
-    my $searchname = $1;
-
-    $channel->{ConfDescription} = $1;
-
-    Say( $self, $dest_nick, "ok, $from_nick", $first_person );
-    return;
-  }
-
-  # what conference is this?
-  if($command =~ /^(?:what|which)\s+conference\s+is\s+this\s*\?$/i) {
-      my $description = $channel->{ConfDescription}
-      			|| GetChannelConfDescription($channel);
-      if (defined $description) {
-	Say( $self,
-	     $dest_nick,
-	     "I have been told this is $description",
-	     $first_person );
-      }
-      else {
-	Say( $self, $dest_nick, "no conference has been identified yet, $from_nick", $first_person )
-      }
-      return;
-  }
-
-  # what is the conference code?
-  if($command =~ /^(?:what|)(?:'s\s+the\s+|\s+is\s+the\s+|)\s*(?:conference|pass|)\s*code\s*\?$/i) {
-      my $description = $channel->{ConfDescription}
-      			|| GetChannelConfDescription($channel);
-      if (defined $description) {
-	Say( $self,
-	     $dest_nick,
-	     "I have been told this is $description",
-	     $first_person );
-      }
-      else {
-	Say( $self, $dest_nick, "no conference has been identified yet, $from_nick", $first_person )
-      }
       return;
   }
 
@@ -1630,7 +1562,7 @@ sub command_for_me ($$$$$$$) {
 
   if($command=~ /^(?:please\s+|pls\s+)?help/i) {
     my(@help)=(
-      'Please refer to http://www.w3.org/2001/12/zakim-irc-bot for more detailed help.',
+      'Please refer to https://www.w3.org/guide/meetings/zakim.html for more detailed help.',
       'Some of the commands I know are:',
       ' xxx is yyy       - establish yyy as the name of unknown party xxx',
       "                    if yyy is 'me' or 'I', your nick is substituted",
@@ -1638,7 +1570,6 @@ sub command_for_me ($$$$$$$) {
       ' I am xxx         - establish your nick as the name of unknown party xxx',
       " who's here?      - lists the participants on the phone",
       ' is xxx here?     - reports whether a party named like xxx is present',
-      ' this is xxx      - associates this channel with conference xxx',
       ' excuse us        - disconnects from the irc channel',
     );
     for my $output (@help) {
@@ -1847,7 +1778,7 @@ sub command_for_me ($$$$$$$) {
 
   # No command was recognized ...
   # Alan's favorite historic error message
-  if($command =~ /^(?:who's here|who is here|what conference is this|what conferences|is\s+\S+\s+here)$/i) {
+  if($command =~ /^(?:who's here|who is here|what conferences|is\s+\S+\s+here)$/i) {
     $output.="$from_nick, you need to end that query with '?'";
   }
   elsif ($command =~ /\?$/) {
@@ -3778,118 +3709,6 @@ sub NameFromNick
     }
 
     return $name;
-}
-
-
-# GetChannelConfDescription
-# Looks up a pre-assigned conference description using the irc channel name.
-# If no pre-assigned code is found, returns undef
-#
-# Input:
-#	channel		IRC channel object
-#
-# Returns:
-#	description
-
-sub GetChannelConfDescription
-{
-    my ($channel) = @_;
-
-    CheckChannelConfDescriptionFileChanged();
-    my $channel_name = lc($channel->{NAME});
-    if (scalar keys %channelConfDescription > 0) {
-	my $confDescription = $channelConfDescription{$channel_name}->{confDescription};
-	if ($confDescription) {
-	    $channel->{ConfDescription} = $confDescription;
-	}
-    }
-
-    return $channel->{ConfDescription};
-}
-
-
-# Reload the Conference Description file if it has a newer mod time than
-# when it was previously loaded.
-sub CheckChannelConfDescriptionFileChanged()
-{
-    return if (not defined $channelConfDescriptionFile);
-    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,
-	$mtime,$ctime,$blksize,$blocks)
-	= stat($channelConfDescriptionFile);
-
-    if (! defined $mtime) {
-	print "Channel Conference Description file $channelConfDescriptionFile missing\n";
-	return;
-    }
-
-    if ($mtime > $lastChannelConfDescriptionModTime) {
-	open CODES, "< $channelConfDescriptionFile"
-	    or do {
-		warn "Can't open channel conference description file $channelConfDescriptionFile\n";
-		return;
-	    };
-	while (<CODES>) {
-	    (my $channel_name, my $confDescription) = split('\t');
-	    $channel_name = lc($channel_name);
-	    $channelConfDescription{$channel_name}->{confDescription} = $confDescription;
-	}
-	close CODES;
-	$lastChannelConfDescriptionModTime = $mtime;
-	print scalar keys %channelConfDescription, " channel conference descriptions read\n";
-    }
-}
-
-# Rewrite the Conference Description file with the update from just one channel
-# Input:
-#	channel		IRC channel object
-#	all		flag to save all descriptions
-#
-# Returns:
-#			(updates external file)
-
-sub SaveChannelConfDescriptionFile
-{
-    my ($channel, $all) = @_;
-
-    return if (not defined $channel->{ConfDescription} ||
-	       not defined $channelConfDescriptionFile);
-
-    CheckChannelConfDescriptionFileChanged();
-
-    if (not defined $all) {
-	my $channel_name = lc($channel->{NAME});
-	$channelConfDescription{$channel_name}->{confDescription} =
-	    $channel->{ConfDescription};
-    }
-    else {
-	for my $channel (@::Channels) {
-	    my $channel_name = lc($channel->{NAME});
-	    if (defined $channel_name) {
-		$channelConfDescription{$channel_name}->{confDescription} =
-		    $channel->{ConfDescription};
-	    }
-	}
-    }
-
-    open (DESC, "> $channelConfDescriptionFile".($all ? '-all' : ''))
-	or do {
-	    warn "Can't open confDescriptionFile $channelConfDescriptionFile\n";
-	    return;
-	};
-
-    foreach my $channel_name (sort keys %channelConfDescription) {
-	print DESC "$channel_name\t",
-		   $channelConfDescription{$channel_name}->{confDescription},
-		   "\n";
-    }
-
-    close DESC;
-
-    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,
-	$mtime,$ctime,$blksize,$blocks)
-	= stat($channelConfDescriptionFile);
-
-    $lastChannelConfDescriptionModTime = $mtime;
 }
 
 

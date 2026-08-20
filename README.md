@@ -58,35 +58,6 @@ The two forms of this command do the same thing; some people set things up in th
 
 Displays a final list of those who were recognized as being present during the meeting, requests [RRSAgent](rrsagent.md) to create the formatted meeting record, and then departs (see '`bye`').
 
-### Provide a description for the teleconference on the current IRC channel
-
-- `this [conference] is <description>`
-
-Stores `<description>` for later query.
-
-Teleconference participants appreciate having a simple way to retrieve a reminder of the teleconference coordinates; what number to dial or URL to access, what conference code to use, etc. This command saves such information for later query.
-
-```irc
-[16:43] <Alan> zakim, this is WebEx 640 999 321
-[16:43] <Zakim> ok, Alan
-```
-
-### Request the full name of the conference that is associated with the current IRC channel
-
-- `what conference is this?`
-- `what is the conference code?`
-- `what is the passcode?`
-- `what's the conference code?`
-- `what's the code?`
-
-Returns the conference description that was previously entered.
-
-### Saving a conference description for future meetings
-
-`save this conference description`
-
-If the conference description will apply to future teleconferences on this channel you may wish that Zakim save the information more permanently. Zakim does not actually know when your teleconference has started or ended, however. Descriptions previously entered will not be saved when Zakim restarts unless you use this command.
-
 ## Attendance reports
 
 ### Announcing your presence
@@ -610,9 +581,11 @@ Clears (erases) all questions from the list of questions.
 
 ## Change History
 
-### 2026-07
+### 2026-08
 
 Removed `where is <dialing code>?` and other code related to phone numbers.
+
+Removed `this is ...`, `this will be ...`, `what conference is this?` and other features related to conference descriptions since they were rarely used and were often confused with meeting titles set with `meeting: Meeting Title`.
 
 ### 2021-01
 
