@@ -973,7 +973,8 @@ sub command_for_me ($$$$$$$) {
   }
 
   # who is here?
-  if($command =~ /^(?:who's|who\s+is)\s+(still\s+)?(?:here|on\s+the\s+(?:phone|call))\s*\?$/i) {
+  # who is present?
+  if($command =~ /^(?:who's|who\s+is)\s+(still\s+)?(?:here|present|on\s+the\s+(?:phone|call))\s*\??$/i) {
 
       my $present = $channel->{Present};
       if (! defined $present ||
@@ -1547,11 +1548,7 @@ sub command_for_me ($$$$$$$) {
   }
 
   # No command was recognized ...
-  # Alan's favorite historic error message
-  if($command =~ /^(?:who's here|who is here|what conferences)$/i) {
-    $output.="$from_nick, you need to end that query with '?'";
-  }
-  elsif ($command =~ /\?$/) {
+  if ($command =~ /\?$/) {
     $output.="I don't understand your question, $from_nick.";
   }
   elsif ($command =~ /[:;]-?\)/) {
@@ -2423,10 +2420,13 @@ sub watch_significant_events ($$$$$$$) {
 	return 1;
     }
 
-    # take up agendum xxx
+    # take up agendum xxx, take agendum xxx
     # open agendum xxx
     # move to agendum xxx
-    if ($msg =~ m/^\s*(?:please\s+|pls\s+)?(?:take\s+up|open|move\s+to)\s+(?:agenda|agendum|item)\s*(.+)$/i) {
+    # take up first item
+    # take up agenda item xxx
+    # take up xxx
+    if ($msg =~ m/^\s*(?:please\s+|pls\s+)?(?:take\s+up|take|open|move\s+to)\s+(?:first\s+(?:agenda\s+item|agendum|agenda|item)|(?:agenda\s+item|agendum|agenda|item)\s*(.+)|([0-9]+))$/i) {
 	$channel->{MsgTime} = time;
 	if ($channel->{IgnoreAgenda}) {
 	    Say( $self, $dest_nick, "I am ignoring the agenda, $from_nick", 1 )
@@ -2437,7 +2437,10 @@ sub watch_significant_events ($$$$$$$) {
 	    Say( $self, $dest_nick, "I will not do that one-on-one, $from_nick", 1 );
 	    return 1;
 	}
-	my $which = $1;
+	my $which;
+	if (defined $1) { $which = $1; }
+	elsif (defined $2) { $which = $2; }
+	else { $which = 1; } # matched "first agendum/agenda/item/agenda item"
 	my $agenda = $channel->{Agenda};
 
 	unless ($agenda) {

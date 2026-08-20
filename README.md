@@ -58,6 +58,12 @@ Invite [RRSAgent](rrsagent.md) to the current channel, provide the expected acce
 
 The two forms of this command do the same thing; some people set things up in the channel well before the meeting is scheduled to start and the '`prepare`' synonym reduces confusion for others who are already on the channel.
 
+### Provide a meeting title
+
+- `Meeting: Your Meeting Title`
+
+This is primarily for the benefit of [RRSAgent](rrsagent.md), but Zakim will decline to end the meeting unless a title has been specified.
+
 ### End a meeting
 
 - `end [the | this] meeting`
@@ -86,6 +92,8 @@ Good practice is to inform others when you leave or drop off the teleconference 
 
 - `who is here?`
 - `who's here?`
+- `who is present?`
+- `who's present?`
 - `who is on the phone?`
 - `who is on the call?`
 - `who's on the phone?`
@@ -334,7 +342,7 @@ Removes item `<number>` from the agenda. *Note the '`-`' (hyphen) between the wo
 - `open agendum <number|pattern>`
 - `move to agendum <number|pattern>`
 
-Indicates that agenda item `<number>` is open for discussion. This gives Zakim the information needed to respond to subsequent commands. The word '`agendum`' may be mis-written as '`agenda`' or as '`item`'. A text pattern (regular expression) may be given instead of a number if the pattern matches exactly one agendum.
+Indicates that agenda item `<number>` is open for discussion. This gives Zakim the information needed to respond to subsequent commands. The word '`agendum`' may be mis-written as '`agenda`', '`item`', or '`agenda item`'. A text pattern (regular expression) may be given instead of a number if the pattern matches exactly one agendum. '`first`' may be given instead of a number to mean agendum 1.
 
 ### Move to the next agenda item
 
