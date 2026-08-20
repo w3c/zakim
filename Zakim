@@ -105,7 +105,6 @@ my %partyName;			# {id}->{party}
 
 my $IRCtrace = 0;		# turn on IRC debug mode
 
-my $confURI = undef;
 my $AgendaFile;
 my $AdminChannel;		# channel for administrative messages
 
@@ -123,9 +122,7 @@ $::program=basename $0;
 $::Nick='Zakim'; # OK this can be changed if clashes
 $::IRC_Name='Zakim IRC bot';
 
-$::LogActionMsgs=1;
 $::LogUserHosts=0;
-$::OffTopic=1;        # [off] at start of line is not logged
 
 # Global variables
 
@@ -149,8 +146,6 @@ $::Admin_LOG=undef;
 
 # Process ID
 $::PID_File=undef;
-
-$::StatisticsEnabled = 0;	# hold statistics for irc display
 
 ######################################################################
 package URI::irc;
@@ -307,14 +302,11 @@ Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
   where option is one or more of:
    -agenda <file>   updates <file> with the list of meeting agendas
    -confDescriptions <file> conference descriptions by channel
-   -confURI <URI>   URI to which to append conference schedule IDs
    -loggerBot <nick>	irc nick of logger bot (default RRSAgent)
    -meetingData <file>	name of configuration file for Start/End Meeting
    -irctrace	    enable debugging output
    -nick <nick>     set the nick
 
-   -noaction	    Do not log /me messages
-   -noofftopic      Do not ignore lines starting with [off]
    -userhost        Record user\@host in /join messages
    -whoislog <log>  Log nick changes in specified log
 
@@ -323,17 +315,14 @@ EOT
 
   STDOUT->autoflush(1);
 
-  die $usage unless GetOptions ('action!' => \$::LogActionMsgs,
-		       'agenda=s'=> \$AgendaFile,
+  die $usage unless GetOptions ('agenda=s'=> \$AgendaFile,
 		       'confDescriptions=s' => \$channelConfDescriptionFile,
-		       'confURI=s'   => \$confURI,
 		       'irctrace!'  => \$IRCtrace,
 		       'loggerBot=s'  => \$LoggerBot,
 		       'meetingData=s' => \$channelMeetingDataFile,
 		       'nick=s'	 => \$::Nick,
 		       'userhost!' => \$::LogUserHosts,
 		       'whoislog=s'=> \$WhoisLog,
-		       'offtopic!' => \$::OffTopic,
 		      ) && @ARGV==5;
 
   my($password,$uri_string,$channel_title, $log_root)=@ARGV;
@@ -372,7 +361,7 @@ EOT
 
   $::IRC = new Net::IRC;
 
-  my $channel=&Channel_new($uri, $channel_title);
+  my $channel=&Channel_new($uri);
 
   $AdminChannel = $channel;
 
@@ -398,13 +387,10 @@ exit(0);
 				#  {SpeakerQueue}, {SpeakerNotes}, {Agenda}
 				#  {IgnoreAgenda}, {IgnoreQueue}
 
-sub Channel_new ($$) {
-  my($uri,$title)=@_;
+sub Channel_new ($) {
+  my($uri)=@_;
 
   my $self={};
-
-  # Channel title
-  $self->{Title}=$title;
 
   # irc:: URI
   $self->{URI}=$uri;
@@ -412,14 +398,8 @@ sub Channel_new ($$) {
   # topic of channel
   $self->{Topic}='';
 
-  # Last ID seen
-  $self->{Last_ID}='';
-
   # True if logging
   $self->{Listening}=0;
-
-  # Track midnight rollover
-  $self->{hour}= undef;
 
   # NET::IRC connection object
   $self->{CONN}=undef;
@@ -957,7 +937,6 @@ sub command_for_me ($$$$$$$) {
   unless (defined $channel ||
 	  $command =~ /^(?:please\s+|pls\s+)?help/i ||
 	  $command =~ /^(?:are\s+you\s+)?(?:busy\s*\?)/i ||
-	  $command =~ /^(?:stats|statistics)/i ||
 	  $command =~ /^(?:please\s+|pls\s+)?(?:quit|finish|terminate|die|exterminate|stop)$/i ) {
       Say( $self,
 	   $dest_nick,
@@ -1029,26 +1008,6 @@ sub command_for_me ($$$$$$$) {
       return;
     }
 
-    # clear statistics
-    if($command =~ /^(?:clear\s+stats|clear\s+statistics)$/i) {
-	Say( $self, $dest_nick, "done, $from_nick", $first_person );
-	return;
-    }
-
-    # disable statistics
-    if($command =~ /^(?:disable\s+stats|disable\s+statistics)$/i) {
-	$::StatisticsEnabled = 0;
-	Say( $self, $dest_nick, "statistics will not be held, $from_nick", $first_person );
-	return;
-    }
-
-    # enable statistics
-    if($command =~ /^(?:enable\s+stats|enable\s+statistics)$/i) {
-	$::StatisticsEnabled = 1;
-	Say( $self, $dest_nick, "statistics will be held, $from_nick", $first_person );
-	return;
-    }
-
   }
 
   # please excuse us
@@ -1072,12 +1031,6 @@ sub command_for_me ($$$$$$$) {
 
     LeaveChannel($self, $channel, $event, $channel_name);
     return;
-  }
-
-  # statistics
-  if($command =~ /^(?:stats|statistics)$/i) {
-      Say( $self, $dest_nick, "Sorry, $from_nick, no statistics yet", $first_person );
-      return;
   }
 
   # is xxx here?
@@ -2226,13 +2179,6 @@ sub _doWhoIs
     }
 }
 
-
-sub AdminNotice
-{
-    my ($message) = @_;
-    Say( $AdminChannel->{CONN}, $AdminChannel->{NAME}, $message)
-	if $AdminChannel->{Listening};
-}
 
 # on forced disconnect, report what channels had output for debugging
 sub log_pending_output($)
