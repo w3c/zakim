@@ -105,7 +105,6 @@ my %partyName;			# {id}->{party}
 
 my $IRCtrace = 0;		# turn on IRC debug mode
 
-my $AgendaFile;
 my $AdminChannel;		# channel for administrative messages
 
 my $Credentials_filepath = "creds.irc";
@@ -300,7 +299,6 @@ sub main {
   my $usage=<<"EOT";
 Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
   where option is one or more of:
-   -agenda <file>   updates <file> with the list of meeting agendas
    -confDescriptions <file> conference descriptions by channel
    -loggerBot <nick>	irc nick of logger bot (default RRSAgent)
    -meetingData <file>	name of configuration file for Start/End Meeting
@@ -315,8 +313,7 @@ EOT
 
   STDOUT->autoflush(1);
 
-  die $usage unless GetOptions ('agenda=s'=> \$AgendaFile,
-		       'confDescriptions=s' => \$channelConfDescriptionFile,
+  die $usage unless GetOptions ('confDescriptions=s' => \$channelConfDescriptionFile,
 		       'irctrace!'  => \$IRCtrace,
 		       'loggerBot=s'  => \$LoggerBot,
 		       'meetingData=s' => \$channelMeetingDataFile,
@@ -2592,7 +2589,6 @@ sub watch_significant_events ($$$$$$$) {
 	       );
 	    }
 	}
-	ExportAgenda($from_nick);
 	return 1;
     }
 
@@ -2641,7 +2637,6 @@ sub watch_significant_events ($$$$$$$) {
 		     1
 		     );
 	    }
-	    ExportAgenda($from_nick);
 	}
 	else {
 	    Say( $self,
@@ -2759,7 +2754,6 @@ sub watch_significant_events ($$$$$$$) {
 		     $addressed
 		     );
 	    }
-	    ExportAgenda($from_nick);
 	}
 	else {
 	    Say( $self,
@@ -2833,7 +2827,6 @@ sub watch_significant_events ($$$$$$$) {
 		     $addressed
 		     );
 	    }
-	    ExportAgenda($from_nick);
 	}
 	else {
 	    Say( $self,
@@ -3163,7 +3156,6 @@ sub watch_significant_events ($$$$$$$) {
 	     ($addressed ? '' : 'notes ').'agenda cleared',
 	     $addressed
 	    );
-	ExportAgenda($from_nick);
 	return 1;
     }
 
@@ -3678,70 +3670,6 @@ sub FindInArray(@)
     return $multiple ? undef : $found;
 }
 
-
-sub xml_escape ($) {
-  my $string=shift;
-  $string =~ s/\&/\&amp;/g;
-  $string =~ s/</\&lt;/g;
-  $string =~ s/>/\&gt;/g;
-  $string =~ s/[\x00-\x1F]//g;  # remove ASCII 0-31
-  $string =~ s/([\x80-\xFF])/"\&#".ord($1).";"/ge; # escape ASCII 128-255
-  $string;
-}
-
-
-sub ExportAgenda($)
-{
-    my ($from_nick) = @_;
-
-    return if ! $AgendaFile;
-
-    open( RDF, ">$AgendaFile" ) or return;
-
-    print RDF
-'<?xml-stylesheet type="text/css" href="http://www.w3.org/Team/2002/01/rdf-agenda.css" ?>
-<RDF xmlns="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-  xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-  xmlns:dc="http://purl.org/dc/elements/1.1/"
-  xmlns:m="http://www.w3.org/2001/12/09mr#"
-  xmlns:mr76="http://www.w3.org/2000/11/mr76/minutes#">';
-    for my $channel (@::Channels) {
-	next if !$channel->{Agenda};
-	print RDF '
-<m:Teleconference>';
-	my $confName = $channel->{ConferenceName};
-	print RDF '
-  <m:name>', xml_escape($confName), '</m:name>' if $confName;
-	print RDF '
-  <m:location rdf:resource="', xml_escape($channel->{URI}), '" />' if $channel->{URI};
-	print RDF '
-  <mr76:agenda>
-    <Seq>
-      <m:time>',Timestamp(),'</m:time>';
-	for my $agendum (@{$channel->{Agenda}}) {
-	    print RDF '
-      <li><Description>
-        <dc:title>', xml_escape($agendum->{Topic}), '</dc:title>';
-	    print RDF '
-        <mr76:from>', xml_escape($agendum->{Submitter}), '</mr76:from>'
-	        if $agendum->{Submitter};
-	    print RDF '
-        <mr76:via>', xml_escape($agendum->{Via}), '</mr76:via>'
-	        if $agendum->{Via};
-	    print RDF '
-        </Description></li>';
-	}
-	print RDF '
-    </Seq>
-  </mr76:agenda>
-</m:Teleconference>
-';
-    }
-    print RDF '
-</RDF>
-';
-    close RDF;
-}
 
 sub ReapIdleChannels($)
 {
