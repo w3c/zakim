@@ -58,12 +58,6 @@ Invite [RRSAgent](https://github.com/w3c/rrsagent) to the current channel, provi
 
 The two forms of this command do the same thing; some people set things up in the channel well before the meeting is scheduled to start and the '`prepare`' synonym reduces confusion for others who are already on the channel.
 
-### Provide a meeting title
-
-- `Meeting: Your Meeting Title`
-
-This is primarily for the benefit of [RRSAgent](https://github.com/w3c/rrsagent), but Zakim will decline to end the meeting unless a title has been specified.
-
 ### End a meeting
 
 - `end [the | this] meeting`
@@ -196,7 +190,6 @@ Use this command if you wish to speak more than once rather than presenting all 
 ### Place name(s) on the queue of individuals wishing to speak
 
 - `queue= [<name>[, <name> ...]]`
-- `q= <name>[, <name> ...]`
 
 or replacing any names already on the queue. If '`queue`' is spelled out and no names are specified then the queue is cleared.
 
@@ -327,7 +320,6 @@ Replaces the text of item `<number>` with `<newtext>`.
 ### Drop an item from the agenda
 
 - `agenda- <number>`
-- `item- <number>`
 - `delete agendum <number>`
 - `drop agendum <number>`
 - `forget agendum <number>`
