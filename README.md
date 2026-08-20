@@ -31,6 +31,12 @@ You can find the URL for the log being written by RRSAgent by typing the command
 
 `rrsagent, bookmark`
 
+Alternatively, if Zakim is already on a channel with you, you can ask it to join another channel directly:
+
+- `[please] join <channel> [<password>]`
+
+This asks Zakim to join `<channel>` (an irc channel name, with or without the leading '`#`'), using `<password>` as the channel key if the channel requires one.
+
 ## Talking to Zakim
 
 Once Zakim is on your IRC channel, all commands to Zakim begin with
@@ -97,6 +103,13 @@ Good practice is to inform others when you leave or drop off the teleconference 
 
 The report will show participants who are currently in your conference or who had been in the conference earlier and have since departed.
 
+### Produce a report of the IRC nicks of all participants
+
+- `[please] list irc attendees`
+- `[please] list irc participants`
+
+Lists the irc nick, address, and full name (if known) of everyone currently present on the irc channel.
+
 ### Dismissing Zakim
 
 - `[please] excuse us`
@@ -117,6 +130,12 @@ All disconnect the Zakim bot from your IRC channel.
 
 Displays an abbreviated list of some major commands. Due to "flood control" in IRC, this may be slow.
 
+### Check which channels Zakim is listening on
+
+- `[are you] busy?`
+
+Reports which channels Zakim is currently listening on (if any) and, for each, how many minutes have passed since the last message it considered "interesting."
+
 ### Floor Control
 
 Zakim will help track a queue of participants wishing to speak. The commands in this set need not be directly addressed to Zakim; they will be recognized when addressed to no one in particular and also when received as third person ('`/me`') messages.
@@ -125,11 +144,10 @@ Zakim will help track a queue of participants wishing to speak. The commands in 
 
 - `queue+ [<name> [, <name> ...]]`
 - `q+ [<name>[, <name> ...]]`
-- `[<name>] raises hand`
 - `sees <name> [, <name>...] raise hand[s]`
 - `sees <name>'s [, <name>'s...] hand[s] [up]`
 
-If `<name>` is omitted or specified as '`me`', the irc nick issuing the request is used. The last three forms are intended particularly for '`/me`' messages.
+If `<name>` is omitted or specified as '`me`', the irc nick issuing the request is used. The last two forms are intended particularly for '`/me`' messages.
 
 ### Add name to the queue of individuals wishing to speak
 
@@ -150,11 +168,10 @@ If `<name>` is omitted or specified as '`me`', the irc nick issuing the request 
 
 - `queue- [<name>[, <name> ...]]`
 - `q- [<name>[, <name> ...]]`
-- `[<name>] lowers hand`
 - `sees <name> [, <name>...] lower hand[s]`
 - `sees <name>'s [, <name>'s...] hand[s] down`
 
-If `<name>` is omitted or specified as '`me`', the irc nick issuing the request is used. If a `<name>` is given explicitly and if it matches the start of exactly one entry in the queue then it is interpreted as if that full entry were entered; that is, unambiguous abbreviations are recognized. Abbreviations are not recognized if the name is omitted or '`me`' is used; i.e. when the irc nick issuing the request is assumed. The last three forms are intended particularly for '`/me`' messages.
+If `<name>` is omitted or specified as '`me`', the irc nick issuing the request is used. If a `<name>` is given explicitly and if it matches the start of exactly one entry in the queue then it is interpreted as if that full entry were entered; that is, unambiguous abbreviations are recognized. Abbreviations are not recognized if the name is omitted or '`me`' is used; i.e. when the irc nick issuing the request is assumed. The last two forms are intended particularly for '`/me`' messages.
 
 ### Move the speaker to the end of the queue
 
@@ -422,10 +439,8 @@ If the specified agendum is currently open for discussion and the speaker queue 
 
 - `skip agendum <number>`
 - `skip item <number>`
-- `skip this agendum`
-- `skip this item`
 
-Marks item `<number>` or the currently open item as "skipped" and lists it at the end of the agenda after any non-closed items. Items may be skipped even after they have been taken up; e.g. by '`open next agendum`'.
+Marks item `<number>` as "skipped" and lists it at the end of the agenda after any non-closed items. Items may be skipped even after they have been taken up; e.g. by '`open next agendum`'.
 
 ### Clear the agenda
 
@@ -438,12 +453,6 @@ Removes all items from the agenda.
 - `[please] read agenda from <uri>`
 
 Takes `<uri>` as a file of RDF/XML and queries it for agenda items. Any agenda items found will be added to the current agenda. See [description of agenda format](https://www.w3.org/2004/02/agenda) for details on the RDF graph that is expected. Paul Downey wrote a [tool for extracting RDF/XML agendas from text messages](https://blog.whatfettle.com/2006/07/04/rdf-agenda-scraper/); you can append the URI of your text message to Paul's [RDFAgenda](https://whatfettle.com/2006/07/RDFAgenda/) URI to construct a URI for the RDF/XML form of a suitably-formatted text agenda.
-
-### Save agenda to W3C Web site
-
-- `[please] save agenda [team-access|member-access|world-access]`
-
-Writes the current agenda to the Web in RDF/XML form as `https://www.w3.org/yyyy/mm/dd-<channel>-agenda` where '`yyyy`' is the current year, '`mm`' is the current month, and '`dd`' is the current day. If an access option is specified, the URI will be given the corresponding visibility. The suffix `'-access`' may also be written as '`-visible`' or may be omitted entirely.
 
 ### Program a reminder alarm
 

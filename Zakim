@@ -60,21 +60,7 @@ my %channelMeetingData;		# Meeting configuration data
 				# -> {meetingName}
 				# -> {loggerRequests} @ARRAY
 
-my %partyName;			# {id}->{party}
-
-				# Nicks have:
-				# {party} -> Party
-				#   @@ assumes at most 1 telecon per person
-
-				# parties have:
-				# {NameIsUnknown} {NameIsUnsure}
-				# {ArrivalTime} {IRC_user}
-
-				# confs have:
-				# {IRCChannel}
-
 				# channels have:
-				# {BridgeConference} {ConferenceName}
 				# {SpeakerQueue} {SpeakerNotes} {Agenda}->@
 				# {AgendaOrder} {CurrentAgendum}
 				# {CurrentAgendumStarted}
@@ -279,16 +265,6 @@ package main;
 
 
 
-sub removeConfFromChannel
-{
-    my ($conf) = @_;
-    my $channel = $conf->{IRCChannel};
-    if ($channel) {
-	delete $conf->{IRCChannel};
-	delete $channel->{BridgeConference};
-    }
-}
-
 sub main {
   my $usage=<<"EOT";
 Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
@@ -372,7 +348,6 @@ exit(0);
 
 @::Channels=();			# [] -> {CONN}, {NAME}, {URI}, {Topic},
 				#  {Listening}
-				#  {BridgeConference}, {ConferenceName},
 				#  {SpeakerQueue}, {SpeakerNotes}, {Agenda}
 				#  {IgnoreAgenda}, {IgnoreQueue}
 
@@ -493,17 +468,6 @@ sub Channel_by_name($) {
   }
   return undef;
 }
-
-sub Channel_by_nick($) {
-    my ($nick) = @_;
-    my $ircUser = IRCuser::find($nick);
-    my $party = $ircUser ? $ircUser->{party} : undef;
-    if ($party && $party->conf) {
-	return $party->conf->{IRCChannel};
-    }
-    return undef;
-}
-
 
 ######################################################################
 # Logging - methods on Net::IRC::Connection object
@@ -754,8 +718,6 @@ sub on_kick {
 
   # I was kicked
   if (defined $channel) {
-      my $conf = $channel->{BridgeConference};
-      removeConfFromChannel($conf) if $conf;
       $channel->{Listening} = 0;
 
       for (my $index=0; $index <= $#::Channels; $index++) {
@@ -787,16 +749,6 @@ sub on_nick {
   if ($ircUser) {
       $ircUser->nick($newnick);
       $address = $ircUser->address;
-      my ($party, $conf);
-      if (($party = $ircUser->{party}) && ($conf = $party->conf)) {
-	  my $channel = $conf->{IRCChannel};
-	  my $currentQueue = $channel->{SpeakerQueue};
-	  my $position = FindInArray( $currentQueue, $oldnick, 1 );
-	  if (defined $position) {
-	      @{$currentQueue}[$position] = $newnick;
-	      $channel->{SpeakerQueue} = $currentQueue;
-	  }
-      }
       if ($WhoisLog) {
 	  if (open (WHOIS, ">> $WhoisLog")) {
 	      print WHOIS Timestamp(), ' ', $ircUser->address, "\t",
@@ -911,7 +863,7 @@ sub on_whoisuser
 sub command_for_me ($$$$$$$) {
   my($self, $event, $channel_name, $command, $is_private, $first_person, $from_read_process)=@_;
   my $from_nick=$event->nick;
-  my $channel= $is_private ? Channel_by_nick($from_nick)
+  my $channel= $is_private ? undef
       			   : Channel_by_name($channel_name);
 
   my $dest_nick=($is_private ? $from_nick :
@@ -1010,9 +962,7 @@ sub command_for_me ($$$$$$$) {
 	    return;
 	}
 	else {
-	    my $confName = $channel->{ConferenceName};
-	    $confName = $confName ? " ($confName)" : '';
-	    Say( $self, $dest_nick, "leaving $channel_name$confName" );
+	    Say( $self, $dest_nick, "leaving $channel_name" );
 	}
     }
     my $attendees = $channel->{Attendees};
@@ -1022,63 +972,6 @@ sub command_for_me ($$$$$$$) {
     return;
   }
 
-  # is xxx here?
-  # is xxx on the call?
-  # have you seen xxx?
-  if($command =~ /^is\s+(\S+)\s+(?:here|on\s+the\s+call)\s*\?$/i ||
-     $command =~ /^(?:have\s+you\s+|)seen\s+(\S+)\s*\?$/i) {
-      my $query = $1;
-      my $partySeen = '';
-      my $sep = '';
-      my $partyElsewhere = '';
-      my $sepElse = '';
-      my $arrived = '';
-      my $count = 0;
-      my $conf = $channel->{BridgeConference};
-      foreach my $party (values %partyName) {
-	  next unless $party->conf;	# @@ lingering party w/o conf
-	  my $name = $party->name();
-	  if ($name =~ m/^\Q$query\E/i) {
-	      if (defined $conf && $party->conf == $conf) {
-		  $count++;
-		  if ($party->{ArrivalTime} && $count < 2) {
-		      my $ago = int( (time - $party->{ArrivalTime}) / 60 );
-		      if ($ago > 0) {
-			  $arrived = $name
-			      .' arrived '
-			      .$ago
-			      .' minute'
-			      .($ago == 1 ? '' : 's')
-			      .' ago';
-		      }
-		      else {
-			  $arrived = $name.' just arrived';
-		      }
-		  }
-		  else { $arrived = '' };
-		  $partySeen .= $sep.$name;
-		  $sep = ', ';
-	      }
-	      else {
-		  $partyElsewhere .= $sepElse.$name.' in another telecon';
-		  $sepElse = ', ';
-	      }
-	  }
-      }
-      Say( $self,
-	   $dest_nick,
-	   $partySeen ne ''
-		? "probably, $from_nick; "
-		     .($arrived ? $arrived : "I see $partySeen here")
-		: $partyElsewhere eq ''
-		     ? "$from_nick, I do not see ".ucfirst($query).' anywhere'
-		     : "$from_nick, I see $partyElsewhere",
-	   $first_person
-	  );
-      return;
-  }
-
-  # now that 'really' is optional in 'xxx is yyy', this test must come first
   # who is here?
   if($command =~ /^(?:who's|who\s+is)\s+(still\s+)?(?:here|on\s+the\s+(?:phone|call))\s*\?$/i) {
 
@@ -1112,124 +1005,6 @@ sub command_for_me ($$$$$$$) {
     my $title = $1;
     Say( $self, $dest_nick, qq{to set the meeting title please use "meeting: $title", $from_nick}, $first_person );
     return;
-  }
-
-  # All commands of the form 'xxx is ...' that are not renaming a participant
-  # must be tested before this point.
-
-  # xxx is yyy
-  # xxx is perhaps yyy
-  # xxx is probably yyy
-  # xxx is really yyy
-  # xxx is temporarily yyy
-  # xxx may be yyy
-  if(($command =~ /^(\S+)\s+(?:is really|may be|is perhaps|is possibly|is probably|is temporarily|is)\s+(\S+)$/i) && $1 ne 'who' && $1 ne 'what') {
-      my $searchname = $1;
-      my $newname = $2;
-      $newname =~ s/ /_/g;
-      my $nameFlags = '';
-      if ($newname =~ m/^(?:me|i)$/i) { $newname = $from_nick }
-      # $newname = ucfirst($newname);
-      if ($command =~ /\s(?:may be|is perhaps|is possibly|is probably)\s/) {
-	  $newname .= '?';
-	  $nameFlags = 'U';
-      }
-      elsif ($command =~ /\s(?:is temporarily)\s/i) {
-	  $nameFlags = 'T';
-      }
-
-      my $conf = $channel->{BridgeConference};
-      my $party = RenameConfParty( $conf,
-				   $searchname,
-				   $newname,
-				   $nameFlags
-				  );
-      if ($party) {
-          Say( $self, $dest_nick, "+$newname; got it", $first_person );
-      }
-      else {
-	  if ($searchname eq 'where' && $newname =~ m/\+?[-0-9\.]+$/) {
-	      Say( $self, $dest_nick, "$from_nick, I do not see a party named '$searchname'.  If you meant to ask a question you need to add '?'", $first_person );
-	  }
-          elsif (($searchname =~ m/^\?\?P(\d+)$/i)
-		 && (my $party = Party::port2party($1))) {
-	      my $oldname = $party->name;
-	      my $msg = ($first_person ? 'I ' : '')
-		     .'already had ??P'.$1.' as '.$oldname.', '.$from_nick;
-	      if ($command =~ /^(\S+)\s+is really/) {
-		  $party->name($newname);
-		  $msg = "+$newname; got it";
-	      }
-	      Say( $self,
-		   $dest_nick,
-		   $msg,
-		   $first_person );
-	  }
-	  else {
-	      Say( $self,
-		   $dest_nick,
-		   ($newname =~ m'\?$')
-		     ? "sorry, $from_nick, I do not understand your question"
-		     : "sorry, $from_nick, I do not recognize a party named '$searchname'",
-		   $first_person );
-	  }
-      }
-      return;
-  }
-
-  # I am xxxx
-  if($command =~ /^I\s+am\s+(\S+)$/i ||
-     $command =~ /^nick\s+(\S+)\s+is\s+(\S+)$/i) {
-      my $searchname;
-      my $ircUser;
-      unless ($2) {
-	  $searchname = $1;
-	  $ircUser = IRCuser::find($from_nick);
-      }
-      else {
-	  my $nick = $1;
-	  $searchname = $2;
-	  $ircUser = IRCuser::find($nick);
-	  unless ($ircUser) {
-	      Say( $self,
-		   $dest_nick,
-		   "sorry, $from_nick, I do not see '$nick' on this channel",
-		   $first_person
-		  );
-	      return;
-	  }
-      }
-
-      my $newname = $from_nick; # ucfirst($from_nick);
-      my $conf = $channel->{BridgeConference};
-      my ($party, $ambig) = FindConfParty( $conf, $searchname );
-      if (!$party) {
-	  Say( $self,
-	       $dest_nick,
-	       "sorry, $from_nick, I do not see a party named '$searchname'",
-	       $first_person
-	      );
-	  return;
-      }
-
-      $party->{IRC_user} = $ircUser;
-      $ircUser->{party} = $party if $ircUser;
-
-      if ($party->{NameIsUnknown}) {
-	  RenameConfParty( $conf, $searchname, $newname, '' );
-	  Say( $self, $dest_nick, "+$newname; got it", $first_person );
-      }
-      else {
-	  my $nick = $ircUser->nick;
-	  $nick = 'you' if $nick eq $from_nick;
-	  Say( $self,
-	       $dest_nick,
-	       "ok, $from_nick, I now associate $nick with ".$party->name,
-	       $first_person
-	      );
-      }
-
-      return;
   }
 
   # This test must be performed prior to the 'xxx has yyy' test
@@ -1564,12 +1339,7 @@ sub command_for_me ($$$$$$$) {
     my(@help)=(
       'Please refer to https://www.w3.org/guide/meetings/zakim.html for more detailed help.',
       'Some of the commands I know are:',
-      ' xxx is yyy       - establish yyy as the name of unknown party xxx',
-      "                    if yyy is 'me' or 'I', your nick is substituted",
-      ' xxx may be yyy   - establish yyy as possibly the name of unknown party xxx',
-      ' I am xxx         - establish your nick as the name of unknown party xxx',
       " who's here?      - lists the participants on the phone",
-      ' is xxx here?     - reports whether a party named like xxx is present',
       ' excuse us        - disconnects from the irc channel',
     );
     for my $output (@help) {
@@ -1778,7 +1548,7 @@ sub command_for_me ($$$$$$$) {
 
   # No command was recognized ...
   # Alan's favorite historic error message
-  if($command =~ /^(?:who's here|who is here|what conferences|is\s+\S+\s+here)$/i) {
+  if($command =~ /^(?:who's here|who is here|what conferences)$/i) {
     $output.="$from_nick, you need to end that query with '?'";
   }
   elsif ($command =~ /\?$/) {
@@ -1795,137 +1565,6 @@ sub command_for_me ($$$$$$$) {
   }
 
   Say( $self, $dest_nick, $output, $first_person );
-}
-
-
-# Implements the rules for matching strings to party names
-# Inputs: conference, searchname
-#   searchname is a simple string; any unambiguous prefix matches
-# Returns: (party, 0) or (undef, ambig) where ambig is 0 if no match else 1
-sub FindConfParty
-{
-    my ($conf, $searchname) = @_;
-
-    return (undef, 0) unless $conf;
-
-    my $foundParty = undef;
-
-    foreach my $party (values %partyName) {
-	my $name = $party->name;
-	if ($party->conf &&
-	    $party->conf == $conf &&
-	    $name =~ m/^\Q$searchname\E/i) {
-	    if ($foundParty) {
-		# when multiple matches are found, look for an exact match
-		if ($name =~ m/^\Q$searchname\E\??$/i) {
-		    if ($foundParty->name =~ m/^\Q$searchname\E\??$/i) {
-			return (undef, 1); # both are exact matches
-		    }
-		}
-		else {
-		    if ($foundParty->name !~ m/^\Q$searchname\E\??$/i) {
-			return (undef, 1); # neither is an exact match
-		      }
-		    else {
-			next;	# foundParty is a better match
-		    }
-		}
-	    }
-	    $foundParty = $party;
-	}
-    }
-    return ($foundParty, 0) if $foundParty; # found an unambiguous match
-
-    # still not found; if party name contains '.' or '-' or '_',
-    # attempt a match while ignoring those characters
-    foreach my $party (values %partyName) {
-	my $name = $party->name;
-	next unless ($party->conf &&
-		     $party->conf == $conf &&
-		     $name =~ m/[-._]/);
-
-	$name =~ s/\.a*$//; # trim any trailing .a*
-	$name =~ s/[-._]//g; # strip out any of '-._'
-
-	if ($name =~ m/^\Q$searchname\E/i) {
-	    if ($foundParty) {
-		# when multiple matches are found, look for an exact match
-		if ($name =~ m/^\Q$searchname\E\??$/i) {
-		    if ($foundParty->name =~ m/^\Q$searchname\E\??$/i) {
-			return (undef, 1); # both are exact matches
-		    }
-		}
-		else {
-		    if ($foundParty->name !~ m/^\Q$searchname\E\??$/i) {
-			return (undef, 1); # neither is an exact match
-		      }
-		    else {
-			next;	# foundParty is a better match
-		    }
-		}
-	    }
-	    $foundParty = $party;
-	}
-    }
-    return ($foundParty, 0) if $foundParty; # found an unambiguous match
-
-    return (undef, 0);
-}
-
-# If a party name already appears in a conference, add a unique suffix
-# Inputs: conference, partyname
-# Returns: partyname
-sub UniquePartyName
-{
-    my ($conf, $name) = @_;
-
-    my ($party, $ambig) = FindConfParty( $conf, $name );
-
-    if ($party) {
-	my $suffix = 'a';
-	$name .= '.';
-	while ($party) {
-	    $name .= $suffix;
-	    ($party, $ambig) = FindConfParty( $conf, $name );
-	}
-    }
-    return $name;
-}
-
-
-# Inputs: conference, oldname, newname, flags
-#   oldname is a full regex
-#   flags = 'U' - uncertain
-#	    'T' - transient
-# Returns: party if found else undef
-sub RenameConfParty
-{
-    my ($conf, $searchname, $newname, $flags) = @_;
-
-    my ($party, $ambig) = FindConfParty( $conf, $searchname );
-
-    return undef if not defined $party;
-
-    # if the proposed new name would collide with an existing name, alter it
-    my $uniqnewname = $newname;
-    {
-	my ($testParty) = FindConfParty( $conf, $newname );
-	if ($testParty && $testParty->name eq $newname) {
-	    $uniqnewname = UniquePartyName( $conf, $newname );
-	}
-    }
-
-    $party->name($uniqnewname);
-    if ($flags eq 'U') {
-	$party->{NameIsUnsure} = 1;
-    }
-    else {
-	delete $party->{NameIsUnsure};
-    }
-
-    delete $party->{NameIsUnknown};
-
-    return $party;
 }
 
 
@@ -2138,7 +1777,7 @@ sub log_pending_output($)
 sub watch_significant_events ($$$$$$$) {
     my($self, $event, $channel_name, $msg, $is_private, $addressed, $from_read_process)=@_;
     my $from_nick=$event->nick;
-    my $channel= $is_private ? Channel_by_nick($from_nick)
+    my $channel= $is_private ? undef
 			     : Channel_by_name($channel_name);
 
     my $dest_nick=($is_private ? $from_nick : join('',$event->to));
@@ -3609,7 +3248,6 @@ sub ReapIdleChannels($)
     for (my $index=0; $index <= $#::Channels; $index++) {
 	# have to use indexed-for since we intend to modify the array
 	my $channel = $::Channels[$index];
-	next if $channel->{BridgeConference}; # stay if conference is active
 	if ($channel->{Listening} && $channel != $AdminChannel) {
 	    # if nothing interesting has been heard from the channel in 2 hours
 	    # and we have no more reminders to send
@@ -3687,27 +3325,16 @@ sub ResetTalkTimer($$$)
 		   );
 }
 
-# Computes a party name corresponding to an IRC nick
-# This comes from an explicit mapping if given, otherwise strip trailing
-# digits from the nick
+# Computes a party name corresponding to an IRC nick by stripping
+# any trailing digits from the nick
 #
 # Inputs: irc nick
 # Returns: party name
 sub NameFromNick
 {
     my ($nick) = @_;
-    my $name;
-
-    my $ircUser = IRCuser::find($nick);
-
-    if ($ircUser && (my $party = $ircUser->{party})) {
-	$name = $party->name;
-    }
-    else {
-	$name = $nick;
-	$name =~ s/\d+$//;	# trim any trailing digits
-    }
-
+    my $name = $nick;
+    $name =~ s/\d+$//;	# trim any trailing digits
     return $name;
 }
 
