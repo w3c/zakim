@@ -127,9 +127,6 @@ $::LogActionMsgs=1;
 $::LogUserHosts=0;
 $::OffTopic=1;        # [off] at start of line is not logged
 
-@::LogTypes=qw(rdf html txt);
-@::DefaultLogTypes=qw(rdf txt);
-
 # Global variables
 
 # IRC object
@@ -137,9 +134,6 @@ $::IRC=undef;
 
 # root dir of logs
 $::Log_Root='';
-
-# place on the web this corresponds to
-$::Log_URI='';
 
 # System password
 $::Password='';
@@ -314,14 +308,9 @@ Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
    -agenda <file>   updates <file> with the list of meeting agendas
    -confDescriptions <file> conference descriptions by channel
    -confURI <URI>   URI to which to append conference schedule IDs
-   -html            write an XHTML log
    -loggerBot <nick>	irc nick of logger bot (default RRSAgent)
    -meetingData <file>	name of configuration file for Start/End Meeting
-   -notext	    Do not write a text log
    -irctrace	    enable debugging output
-   -log <logfile>   Write logs to logfile rather than the default
-                    of channel/YYYY-MM-DD
-                    (\".txt\", \".html\", and \".rdf\" will be appended)
    -nick <nick>     set the nick
 
    -noaction	    Do not log /me messages
@@ -334,28 +323,20 @@ EOT
 
   STDOUT->autoflush(1);
 
-  my(%do_log_types)=map {$_ => 1} @::DefaultLogTypes;
-
-  my $log_name=undef;
   die $usage unless GetOptions ('action!' => \$::LogActionMsgs,
 		       'agenda=s'=> \$AgendaFile,
 		       'confDescriptions=s' => \$channelConfDescriptionFile,
 		       'confURI=s'   => \$confURI,
-		       'html!'	 => \$do_log_types{'html'},
 		       'irctrace!'  => \$IRCtrace,
 		       'loggerBot=s'  => \$LoggerBot,
 		       'meetingData=s' => \$channelMeetingDataFile,
-		       'text!'	 => \$do_log_types{'txt'},
-		       'log=s'	 => \$log_name,
 		       'nick=s'	 => \$::Nick,
 		       'userhost!' => \$::LogUserHosts,
 		       'whoislog=s'=> \$WhoisLog,
 		       'offtopic!' => \$::OffTopic,
 		      ) && @ARGV==5;
 
-  @::DefaultLogTypes=grep($do_log_types{$_}, @::LogTypes);
-
-  my($password,$uri_string,$channel_title, $log_root, $log_uri_string)=@ARGV;
+  my($password,$uri_string,$channel_title, $log_root)=@ARGV;
 
   my $uri;
   eval '$uri=new URI $uri_string';
@@ -368,7 +349,6 @@ EOT
   # Set globals
   $::Password=$password;
   $::Log_Root=$log_root;
-  $::Log_URI=$log_uri_string;
   $::Departing=0;
   $::Connecting=1;
 
@@ -392,7 +372,7 @@ EOT
 
   $::IRC = new Net::IRC;
 
-  my $channel=&Channel_new($uri, $channel_title, $log_name);
+  my $channel=&Channel_new($uri, $channel_title);
 
   $AdminChannel = $channel;
 
@@ -418,8 +398,8 @@ exit(0);
 				#  {SpeakerQueue}, {SpeakerNotes}, {Agenda}
 				#  {IgnoreAgenda}, {IgnoreQueue}
 
-sub Channel_new ($$$) {
-  my($uri,$title,$log_name)=@_;
+sub Channel_new ($$) {
+  my($uri,$title)=@_;
 
   my $self={};
 
@@ -428,10 +408,6 @@ sub Channel_new ($$$) {
 
   # irc:: URI
   $self->{URI}=$uri;
-
-  # a file prefix to log to (i.e. write log_name.rdf etc.) or undef
-  # to use default schema
-  $self->{LogName}=$log_name;
 
   # topic of channel
   $self->{Topic}='';
@@ -447,11 +423,6 @@ sub Channel_new ($$$) {
 
   # NET::IRC connection object
   $self->{CONN}=undef;
-
-  $self->{LogTypes}=[@::DefaultLogTypes];
-  for my $type (@{$self->{LogTypes}}) {
-    $self->{FH}->{$type}=undef;
-  }
 
   push(@::Channels, $self);
 
