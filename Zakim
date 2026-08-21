@@ -1189,7 +1189,7 @@ sub command_for_me ($$$$$$$) {
   # time each speaker at xx minutes|seconds
   # allow each speaker xx minutes|seconds
   # give each speaker xx minutes|seconds
-  if($command =~ /^(?:please\s+|pls\s+)?(?:time|allow|give)(\s+(?:each\s+|)speakers?)?(\s+at)?\s+(\d+)\s*((?:minutes|mins|min|m|seconds|secs|sec|s))$/i) {
+  if($command =~ /^(?:please\s+|pls\s+)?(?:time|allow|give)(\s+(?:each\s+|)speakers?)?(\s+at)?\s+(\d+)\s*((?:minutes|minute|mins|min|m|seconds|secs|sec|s))$/i) {
       my $talkTime = $3;
       $talkTime = $talkTime * 60 if $4 =~ /^m/;
       if ($talkTime < 60) {
