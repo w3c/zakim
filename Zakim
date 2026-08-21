@@ -70,7 +70,7 @@ my %channelMeetingData;		# Meeting configuration data
 				# {FinalReminder}
 				# {SpeakerTalkTime} {TalkTimerVersion}
 				# {LastAckdSpeaker}
-				# {NamesRequested}
+				# {NamesRequested} {IrcAttendeesRequested}
 				# {NicksPresent}
 				# {Attendees}
 				# {Present}
@@ -581,19 +581,32 @@ sub on_names {
       push( @{$channel->{NicksPresent}}, $ircUser );
   }
 
-  return unless defined $channel->{NamesRequested};
-
   my $dest_nick = $channel_name;
 
-  $list =~ s/ /, /g;
+  if (defined $channel->{NamesRequested}) {
+      my $first_person = delete $channel->{NamesRequested};
+      my $commalist = $list;
+      $commalist =~ s/ /, /g;
 
-  my $first_person = $channel->{NamesRequested};
+      Say( $self,
+	   $dest_nick,
+	   ($first_person ? 'On IRC I see ' : 'sees on irc: ').$commalist,
+	   $first_person );
+  }
 
-  Say( $self,
-       $dest_nick,
-       ($first_person ? 'On IRC I see ' : 'sees on irc: ').$list,
-       $first_person );
-  delete $channel->{NamesRequested};
+  if (defined $channel->{IrcAttendeesRequested}) {
+      my $first_person = delete $channel->{IrcAttendeesRequested};
+
+      Say( $self, $dest_nick, 'Those currently present on irc are:', $first_person );
+      for my $ircUser (@{$channel->{NicksPresent}}) {
+	  Say( $self,
+	       $dest_nick,
+	       $ircUser->nick.' '.$ircUser->address.' ('.($ircUser->fullname || '').')',
+	       $first_person
+	     );
+      }
+      Say( $self, $dest_nick, '. end of irc participants', $first_person );
+  }
 }
 
 
@@ -1304,16 +1317,9 @@ sub command_for_me ($$$$$$$) {
   # please list irc attendees
   # please list irc participants
   if($command =~ /^(?:please\s+|pls\s+|)list\s+irc\s+(?:attendees|participants)$/i) {
-    my @rest = @{$channel->{NicksPresent}};
-    Say( $self, $dest_nick, 'Those currently present on irc are:', $first_person );
-    while(@rest && (my $nick = shift @rest)) {
-	Say( $self,
-	     $dest_nick,
-	     $nick->nick.' '.$nick->address.' ('.($nick->fullname || '').')',
-	     $first_person
-	   );
-    }
-    Say( $self, $dest_nick, ". end of irc participants", $first_person );
+    $channel->{NicksPresent} = []; # prepare to receive a fresh reply
+    $self->names( $channel_name );
+    $channel->{IrcAttendeesRequested} = $first_person;
     return;
   }
 
