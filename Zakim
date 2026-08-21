@@ -267,7 +267,7 @@ package main;
 
 sub main {
   my $usage=<<"EOT";
-Usage: $::program [option...] password channel-URI channel-title log-dir log-URI
+Usage: $::program [option...] password channel-URI log-dir
   where option is one or more of:
    -loggerBot <nick>	irc nick of logger bot (default RRSAgent)
    -meetingData <file>	name of configuration file for Start/End Meeting
@@ -288,9 +288,9 @@ EOT
 		       'nick=s'	 => \$::Nick,
 		       'userhost!' => \$::LogUserHosts,
 		       'whoislog=s'=> \$WhoisLog,
-		      ) && @ARGV==5;
+		      ) && @ARGV==3;
 
-  my($password,$uri_string,$channel_title, $log_root)=@ARGV;
+  my($password,$uri_string,$log_root)=@ARGV;
 
   my $uri;
   eval '$uri=new URI $uri_string';
