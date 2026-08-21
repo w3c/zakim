@@ -898,8 +898,8 @@ sub on_whoisuser
   print "$usernick is ", $ircUser->address, " ($fullname)\n";
 }
 
-sub command_for_me ($$$$$$$) {
-  my($self, $event, $channel_name, $command, $is_private, $first_person, $from_read_process)=@_;
+sub command_for_me ($$$$$$) {
+  my($self, $event, $channel_name, $command, $is_private, $first_person)=@_;
   my $from_nick=$event->nick;
   my $channel= $is_private ? undef
       			   : Channel_by_name($channel_name);
@@ -1323,47 +1323,6 @@ sub command_for_me ($$$$$$$) {
     return;
   }
 
-  # please read xxx from yyy
-  if($command =~ /^(?:please\s+|pls\s+|)read\s+(\S+)\s+from\s+(\S+)$/i) {
-      my $form = $1;
-      my $source = $2;
-
-      my $cmd = "make INPUT='$source' $form|";
-      local *HANDLE;
-      unless (open(HANDLE, $cmd)) {
-	  Say( $self,
-	       $dest_nick,
-	       "sorry, $from_nick, got an error from that source",
-	       $first_person
-	     );
-	  return;
-      }
-
-      my $h = *HANDLE;
-      $h->blocking(0);
-
-      my $closure = {
-	  'conn'	=> $self,
-	  'handle'	=> $h,
-	  'event'	=> $event,
-	  'channelN'	=> $channel_name,
-	  'dest_nick'	=> $dest_nick,
-	  'is_private'	=> $is_private,
-	  'addressed'	=> $first_person,
-	  'done_msg'	=> "done reading $form, $from_nick",
-      };
-
-      $::IRC->addfh($h, \&ProcessReaderHandler, 'r', $closure);
-
-      Say( $self,
-	   $dest_nick,
-	   "working on it, $from_nick",
-	   $first_person
-	 );
-
-      return;
-  }
-
   $output = "";			# @@ RRS
 
   if($command=~ /^(?:please\s+|pls\s+)?help/i) {
@@ -1414,7 +1373,7 @@ sub command_for_me ($$$$$$$) {
     return;
   }
 
-  return if watch_significant_events($self, $event, $channel_name, $command, $is_private, $first_person, $from_read_process);
+  return if watch_significant_events($self, $event, $channel_name, $command, $is_private, $first_person);
 
   if($command =~ /^(?:who\s+is|who's)\s+not\s+making\s+any\s+sense\?$/) {
     Say( $self, $dest_nick,
@@ -1816,8 +1775,8 @@ sub log_pending_output($)
 # to the bot.
 #
 # Returns 0 if no such message was found, else 1
-sub watch_significant_events ($$$$$$$) {
-    my($self, $event, $channel_name, $msg, $is_private, $addressed, $from_read_process)=@_;
+sub watch_significant_events ($$$$$$) {
+    my($self, $event, $channel_name, $msg, $is_private, $addressed)=@_;
     my $from_nick=$event->nick;
     my $channel= $is_private ? undef
 			     : Channel_by_name($channel_name);
@@ -2133,12 +2092,12 @@ sub watch_significant_events ($$$$$$$) {
 		if ($2) {
 		    $agendum->{Submitter} = $2;
 		    $agendum->{Via} = $from_nick
-			unless $from_read_process || lc($2) eq lc($from_nick);
+			unless lc($2) eq lc($from_nick);
 		}
 	    }
 	    else {
 		$agendum->{Topic} = $topic;
-		$agendum->{Submitter} = $from_nick unless $from_read_process;
+		$agendum->{Submitter} = $from_nick;
 	    }
 	    if ($agenda) {
 		push(@{$agenda}, $agendum);
@@ -3585,44 +3544,6 @@ sub AcknowledgeSpeaker
     $channel->{LastAckdSpeaker} = $queuedName || $speaker; # ucfirst($queuedName || $speaker);
 
     return ($queuedName, $speakerNote);
-}
-
-# Handles subprocess output
-sub ProcessReaderHandler
-{
-    my ($closure) = @_;
-
-    my $conn = $closure->{conn};
-    my $channel_name = $closure->{channelN};
-    my $dest_nick = $closure->{dest_nick};
-    my $handle = $closure->{handle};
-
-    my $input = <$handle>;
-
-    unless (defined $input) {
-	$::IRC->removefh($handle);
-	close $handle;
-	Say( $conn, $dest_nick, $closure->{done_msg}, $closure->{addressed} );
-	print $closure->{done_msg}, "\n";
-	return;
-    }
-
-    chomp $input;
-    print "ProcessReader heard '",$input,"'\n";
-
-    if ($input =~ m/^cmd: (.*)$/) {
-	my $cmd = $1;
-	Say( $conn, $dest_nick, $cmd, $closure->{addressed} );
-	command_for_me($conn, $closure->{event}, $channel_name, $cmd,
-		       $closure->{is_private}, $closure->{addressed}, 1);
-    } elsif ($input =~ m/^cmdnoecho: (.*)$/) {
-	my $cmd = $1;
-	command_for_me($conn, $closure->{event}, $channel_name, $cmd,
-		       $closure->{is_private}, $closure->{addressed}, 1);
-    } elsif ($input =~ m/^echo: (.*)$/) {
-	my $cmd = $1;
-	Say( $conn, $dest_nick, $cmd, $closure->{addressed} );
-    }
 }
 
 __END__

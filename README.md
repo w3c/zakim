@@ -458,12 +458,6 @@ Marks item `<number>` as "skipped" and lists it at the end of the agenda after a
 
 Removes all items from the agenda.
 
-### Read agenda from another source
-
-- `[please] read agenda from <uri>`
-
-Takes `<uri>` as a file of RDF/XML and queries it for agenda items. Any agenda items found will be added to the current agenda. See [description of agenda format](https://www.w3.org/2004/02/agenda) for details on the RDF graph that is expected. Paul Downey wrote a [tool for extracting RDF/XML agendas from text messages](https://blog.whatfettle.com/2006/07/04/rdf-agenda-scraper/); you can append the URI of your text message to Paul's [RDFAgenda](https://whatfettle.com/2006/07/RDFAgenda/) URI to construct a URI for the RDF/XML form of a suitably-formatted text agenda.
-
 ### Program a reminder alarm
 
 - `[please] ping [me|us] in <interval> [minutes|hours]`
