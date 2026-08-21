@@ -1340,8 +1340,17 @@ sub command_for_me ($$$$$$$) {
     my(@help)=(
       'Please refer to https://www.w3.org/guide/meetings/zakim.html for more detailed help.',
       'Some of the commands I know are:',
-      " who's here?      - lists the participants on the phone",
-      ' excuse us        - disconnects from the irc channel',
+      ' start meeting          - invite RRSAgent and get things going',
+      ' agenda+ <text>         - add an item to the agenda',
+      ' agenda?                - show the agenda',
+      ' take up agendum <n>    - open agenda item <n> for discussion',
+      ' next agendum           - move on to the next agenda item',
+      ' close this agendum     - close the agenda item now under discussion',
+      ' present+ [<name>]      - inform Zakim that <name> has joined',
+      " who's here?            - lists the participants on the call",
+      ' q+ [<name>]            - add <name> to the speaker queue',
+      ' end meeting            - wrap up and ask RRSAgent to draft minutes',
+      ' bye                    - disconnects Zakim from the irc channel',
     );
     for my $output (@help) {
        Say ($self, $dest_nick, $output, $first_person );
