@@ -87,18 +87,21 @@ my $IRCtrace = 0;		# turn on IRC debug mode
 
 my $AdminChannel;		# channel for administrative messages
 
-my $Credentials_filepath = "creds.irc";
+my $Credentials_filepath = undef;
 
 my $ReaperInterval = 1800;	# seconds between checks for idle channels
 my $ReaperThreshold = 7200;	# seconds since last 'interesting' message
 				#   after which bot resigns from channel
 my $ReaperScheduled = 0;	# reap idle channels semaphore
 
-my $WhoisLog = undef;		# name for WHOIS logfile; not kept by default
+my $WhoisLog = 0;		# if true, keep a WHOIS/nick-change log; off by default
 
 $::program=basename $0;
 
-$::Nick='Zakim'; # OK this can be changed if clashes
+# default nick includes the login name of whoever is running this,
+# to help track the source of unidentified Zakim test bots
+my $login_name = getpwuid($>) // $>;
+$::Nick="Zakim-test-$login_name";
 $::IRC_Name='Zakim IRC bot';
 
 $::LogUserHosts=0;
@@ -108,10 +111,14 @@ $::LogUserHosts=0;
 # IRC object
 $::IRC=undef;
 
-# root dir of logs
-$::Log_Root='';
+# root dir of logs (where the admin log and, if enabled, the WHOIS log are written)
+$::Log_Root='/tmp';
 
-# System password
+# dir where the PID file is written
+$::Run_Dir='/tmp';
+
+# System password; admin functions (restart, debug, quit, etc.) are
+# disabled if -adminpw not specified
 $::Password='';
 
 # True if leaving (so don't reconnect)
@@ -125,6 +132,15 @@ $::Admin_LOG=undef;
 
 # Process ID
 $::PID_File=undef;
+
+# Clean up the PID file on any exit, however it happens.  END runs on
+# normal exit() and on die propagating out, but not on an uncaught
+# fatal signal, so also turn the signals we're likely to receive
+# (systemd stop, Ctrl-C) into a normal exit rather than an abrupt kill.
+END {
+    unlink $::PID_File if defined $::PID_File;
+}
+$SIG{INT} = $SIG{TERM} = sub { exit(0); };
 
 ######################################################################
 package URI::irc;
@@ -267,50 +283,57 @@ package main;
 
 sub main {
   my $usage=<<"EOT";
-Usage: $::program [option...] password channel-URI log-dir
+Usage: $::program [option...] channel-URI
   where option is one or more of:
-   -loggerBot <nick>	irc nick of logger bot (default RRSAgent)
-   -meetingData <file>	name of configuration file for Start/End Meeting
-   -irctrace	    enable debugging output
-   -nick <nick>     set the nick
-
-   -userhost        Record user\@host in /join messages
-   -whoislog <log>  Log nick changes in specified log
+   -nick <nick>         set the IRC nick to be used by this bot
+   -creds <file>        file of per-server irc credentials (optional)
+   -meetingData <file>  name of configuration file for Start/End Meeting
+   -logdir <dir>        where to write the admin log (default /tmp)
+   -rundir <dir>        where to write the PID file (default /tmp)
+   -loggerBot <nick>    irc nick of companion logger bot (default RRSAgent)
+   -userhost            Record user\@host in /join messages
+   -whoislog            keep a WHOIS/nick-change log
+   -irctrace            enable debugging output
+   -adminpw <password>  admin password for privileged commands (optional)
 
   and channel-URI is like irc://host[:port]/channel
 EOT
 
   STDOUT->autoflush(1);
 
-  die $usage unless GetOptions ('irctrace!'  => \$IRCtrace,
-		       'loggerBot=s'  => \$LoggerBot,
-		       'meetingData=s' => \$channelMeetingDataFile,
-		       'nick=s'	 => \$::Nick,
-		       'userhost!' => \$::LogUserHosts,
-		       'whoislog=s'=> \$WhoisLog,
-		      ) && @ARGV==3;
+  die $usage unless GetOptions (
+	'adminpw=s'	=> \$::Password,
+	'creds=s'	=> \$Credentials_filepath,
+	'irctrace!'	=> \$IRCtrace,
+	'logdir=s'	=> \$::Log_Root,
+	'loggerBot=s'	=> \$LoggerBot,
+	'meetingData=s'	=> \$channelMeetingDataFile,
+	'nick=s'	=> \$::Nick,
+	'rundir=s'	=> \$::Run_Dir,
+	'userhost!'	=> \$::LogUserHosts,
+	'whoislog!'	=> \$WhoisLog,
+    ) && @ARGV==1;
 
-  my($password,$uri_string,$log_root)=@ARGV;
+  my($uri_string)=@ARGV;
 
   my $uri;
   eval '$uri=new URI $uri_string';
-  die "$::program: '$uri_string' does not look like an IRC URI\n" 
+  die "$::program: '$uri_string' does not look like an IRC URI\n"
     if ($@ || !$uri);
 
 
-  die "$::program: log dir $log_root does not exist\n" unless -d $log_root;
+  die "$::program: log dir $::Log_Root does not exist\n" unless -d $::Log_Root;
+  die "$::program: run dir $::Run_Dir does not exist\n" unless -d $::Run_Dir;
 
   # Set globals
-  $::Password=$password;
-  $::Log_Root=$log_root;
   $::Departing=0;
   $::Connecting=1;
 
   # Open the administrative log file
-  my $admin_log_file=$::Log_Root.'/'.$::Nick.'.log';
+  my $admin_log_file=$::Log_Root.'/admin.log';
 
   $::Admin_LOG=new IO::File;
-  $::Admin_LOG->open(">>$admin_log_file") 
+  $::Admin_LOG->open(">>$admin_log_file")
     or die "$::program Failed to append to admin log file $admin_log_file - $!\n";
   $::Admin_LOG->autoflush(1);
 
@@ -319,7 +342,7 @@ EOT
   # FIXME - pid_file should not have channel in it, when logger
   # handles multiple channels
   my $channel_name=$uri->channel;
-  $::PID_File=$::Log_Root.'/'.$::Nick.'-'.$channel_name.'.pid';
+  $::PID_File=$::Run_Dir.'/'.$::Nick.'-'.$channel_name.'.pid';
   open(PID,">$::PID_File");
   print PID "$$\n";
   close(PID);
@@ -385,14 +408,15 @@ sub Channel_join($) {
 
   my $irchost = $uri->host;
   my $ircport = $uri->port;
-  my $user_name=$channel_name.'-bridge';
+  my $user_name = $::Nick;
   my $ircpwd=undef;
   my $ssl=0;
 
   {
+    last unless defined $Credentials_filepath;
     open CRED, "< $Credentials_filepath"
 	or do {
-	    warn "no IRC credentials found\n";
+	    warn "Can't open credentials file $Credentials_filepath\n";
 	    last;
         };
     while (<CRED>) {
@@ -585,7 +609,6 @@ sub on_disconnect {
   return if $::Departing;
 
   log_admin_event($self, $event, time, "Attempting to reconnect");
-  unlink $::PID_File;
   print $m, "\n";
   exit(0);
 }
@@ -750,13 +773,14 @@ sub on_nick {
       $ircUser->nick($newnick);
       $address = $ircUser->address;
       if ($WhoisLog) {
-	  if (open (WHOIS, ">> $WhoisLog")) {
+	  my $whoislog_path = $::Log_Root.'/whois.log';
+	  if (open (WHOIS, ">> $whoislog_path")) {
 	      print WHOIS Timestamp(), ' ', $ircUser->address, "\t",
 			  $newnick, "\t(", $ircUser->fullname, ")\n";
 	      close WHOIS;
 	  }
 	  else {
-	      warn "Can't open WHOIS log $WhoisLog\n";
+	      warn "Can't open WHOIS log $whoislog_path\n";
 	  }
       }
   }
@@ -789,10 +813,10 @@ sub on_join {
   my ($channel_name) = ($event->to)[0];
   my $user_nick=$event->nick;
 
-  my $format=$::LogUserHosts ? "%s (%s) has joined $channel_name" :
-                               "%s has joined $channel_name";
   my $t=time;
-  my $m=sprintf($format, $user_nick, $event->userhost);
+  my $m=$::LogUserHosts
+      ? sprintf("%s (%s) has joined $channel_name", $user_nick, $event->userhost)
+      : sprintf("%s has joined $channel_name", $user_nick);
 
   my $channel = Channel_by_name($channel_name);
   if (!$channel) {
@@ -847,13 +871,14 @@ sub on_whoisuser
   }
 
   if ($changed && $WhoisLog) {
-      if (open (WHOIS, ">> $WhoisLog")) {
+      my $whoislog_path = $::Log_Root.'/whois.log';
+      if (open (WHOIS, ">> $whoislog_path")) {
 	  print WHOIS Timestamp(), ' ', $ircUser->address, "\t",
 	  	      $usernick, "\t(", $fullname, ")\n";
 	  close WHOIS;
       }
       else {
-	  warn "Can't open WHOIS log $WhoisLog\n";
+	  warn "Can't open WHOIS log $whoislog_path\n";
       }
   }
 
@@ -936,7 +961,6 @@ sub command_for_me ($$$$$$$) {
       # Log who told me to quit
       log_admin_event($self, $event, time, "$::Nick told to quit");
       $self->quit;
-      unlink $::PID_File;
       exit(0);
     }
 
@@ -1360,9 +1384,15 @@ sub command_for_me ($$$$$$$) {
 
   if($command =~ /^adminhelp/i) {
     my(@help)=(
-      "Administrative commands are as follows:",
-      "These commands work only with the admin PASSWORD like this:",
-      "/msg $::Nick password PASSWORD command'",
+      "Administrative commands require the admin password; send them as:",
+      "  /msg $::Nick password PASSWORD <command>",
+      "where <command> is one of:",
+      ' restart                  - reconnect to the server',
+      ' debug / nodebug          - turn irc protocol tracing on/off',
+      ' quit                     - shut down and leave all channels',
+      ' announce <text>          - say <text> aloud on all channels',
+      ' remark / whisper <text>  - say <text> quietly on all channels',
+      ' part <channel>           - leave the named channel',
     );
     for my $output (@help) {
       Say( $self, $dest_nick, $output, $first_person );
@@ -1791,9 +1821,6 @@ sub watch_significant_events ($$$$$$$) {
     return 0 if !$channel;
 
     $msg =~ s/ *$//;
-
-#    my $conf = $channel->{BridgeConference};
-#    return 0 unless $conf;
 
     # queue+, queue-, queue=, sees xxx raise hand
     if ($msg =~ m/^\s*(?:queue|q|qq)((?:-|\+\s+also|\+|=))[:=]?\s*(.*)$/i ||
@@ -3602,7 +3629,20 @@ zakim - IRC bot meeting facilitator
 
 =head1 SYNOPSIS
 
+  zakim [options] channel-URI
+
+Run with no arguments to see the full list of options and their defaults.
+
 =head1 DESCRIPTION
+
+Zakim is an IRC bot that helps facilitate meetings: tracking a queue
+of speakers, maintaining a meeting agenda, and coordinating with
+RRSAgent to produce a record of the meeting.  It is normally invited
+into a meeting's IRC channel (C<< /invite Zakim <channel> >>) and
+addressed there as C<Zakim, ...>.
+
+See the accompanying F<README.md> for the full list of commands
+Zakim understands.
 
 =head2 LICENSE
 

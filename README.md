@@ -82,6 +82,15 @@ Informs Zakim and all others present on the irc channel that you have left the t
 
 Good practice is to inform others when you leave or drop off the teleconference or leave the meeting room.
 
+`+<name>` and `-<name>` are shorthand for `present+ <name>` and `present- <name>` respectively.
+
+### Replace the list of present participants
+
+- `present= [<name>[, <name> ...]]`
+- `present: [<name>[, <name> ...]]`
+
+Replaces the whole list of present participants, rather than adding or removing individual names. If no names are specified, the list is cleared.
+
 ### Produce a report of the current participants in your conference
 
 - `who is here?`
@@ -116,6 +125,7 @@ Lists the irc nick, address, and full name (if known) of everyone currently pres
 
 - `[please] excuse us`
 - `bye`
+- `goodbye`
 - `[please] part`
 - `[please] leave`
 
@@ -586,6 +596,15 @@ Clears (erases) all questions from the list of questions.
 [17:50] * Zakim notes questions cleared
 [17:50] <Ralph> questions?
 [17:50] * Zakim sees no questions
+```
+## Updating Zakim
+
+To suggest changes to the way Zakim works please [create an issue](https://github.com/w3c/zakim/issues) and/or [pull request](https://github.com/w3c/zakim/pulls) in this repo.
+
+To run and test changes to Zakim, connect to [W3C's IRC server](https://www.w3.org/guide/meetings/irc.html) on a test channel such as `#zakimtest` rather than a real meeting channel, for example:
+
+```bash
+perl ./Zakim irc://irc.w3.org:6667/zakimtest
 ```
 
 ## Change History
