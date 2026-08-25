@@ -1343,7 +1343,7 @@ sub command_for_me ($$$$$$) {
 
   if($command=~ /^(?:please\s+|pls\s+)?help/i) {
     my(@help)=(
-      'Please refer to https://www.w3.org/guide/meetings/zakim.html for more detailed help.',
+      'Please refer to https://github.com/w3c/zakim for more detailed help.',
       'Some of the commands I know are:',
       ' start meeting          - invite RRSAgent and get things going',
       ' agenda+ <text>         - add an item to the agenda',

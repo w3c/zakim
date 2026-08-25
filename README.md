@@ -609,6 +609,8 @@ Removed `where is <dialing code>?` and other code related to phone numbers.
 
 Removed `this is ...`, `this will be ...`, `what conference is this?` and other features related to conference descriptions since they were rarely used and were often confused with meeting titles set with `meeting: Meeting Title`.
 
+Code moved from W3C's internal CVS repository into a public GitHub repo.
+
 ### 2021-01
 
 Added question management. Added `other than` support for `pick a scribe`. Fixed the bug that clearing the agenda failed to reset all agenda state.
