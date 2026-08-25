@@ -89,6 +89,8 @@ my $AdminChannel;		# channel for administrative messages
 
 my $Credentials_filepath = undef;
 
+my $Adminpw_filepath = undef;
+
 my $ReaperInterval = 1800;	# seconds between checks for idle channels
 my $ReaperThreshold = 7200;	# seconds since last 'interesting' message
 				#   after which bot resigns from channel
@@ -294,7 +296,7 @@ Usage: $::program [option...] channel-URI
    -userhost            Record user\@host in /join messages
    -whoislog            keep a WHOIS/nick-change log
    -irctrace            enable debugging output
-   -adminpw <password>  admin password for privileged commands (optional)
+   -adminpw <file>      file containing the admin password (optional)
 
   and channel-URI is like irc://host[:port]/channel
 EOT
@@ -302,7 +304,7 @@ EOT
   STDOUT->autoflush(1);
 
   die $usage unless GetOptions (
-	'adminpw=s'	=> \$::Password,
+	'adminpw=s'	=> \$Adminpw_filepath,
 	'creds=s'	=> \$Credentials_filepath,
 	'irctrace!'	=> \$IRCtrace,
 	'logdir=s'	=> \$::Log_Root,
@@ -324,6 +326,20 @@ EOT
 
   die "$::program: log dir $::Log_Root does not exist\n" unless -d $::Log_Root;
   die "$::program: run dir $::Run_Dir does not exist\n" unless -d $::Run_Dir;
+
+  if (defined $Adminpw_filepath) {
+      if (open ADMINPW, "< $Adminpw_filepath") {
+	  my $pw = <ADMINPW>;
+	  close ADMINPW;
+	  if (defined $pw) {
+	      chomp $pw;
+	      $::Password = $pw;
+	  }
+      }
+      else {
+	  warn "Can't open admin password file $Adminpw_filepath\n";
+      }
+  }
 
   # Set globals
   $::Departing=0;
