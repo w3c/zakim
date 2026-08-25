@@ -1299,7 +1299,7 @@ sub command_for_me ($$$$$$) {
 
       Say( $self,
 	   $dest_nick,
-	   'Not knowing who is chairing or who scribed recently, I propose '.@{$present}[$nominee],
+	   'Not knowing who is chairing or who scribed recently, I propose Gerald',
 	   1
 	 );
       return;
