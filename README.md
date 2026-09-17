@@ -2,7 +2,7 @@
 
 ## General Description
 
-The Zakim IRC "bot" is a Semantic Web agent ("swagent") that helps facilitate meetings using IRC.
+The Zakim IRC bot helps facilitate meetings using IRC. It can record attendance, and help manage the agenda and the speaker queue.
 
 It is generally available on W3C's IRC server, under the "Zakim" nickname.
 
