@@ -1258,7 +1258,7 @@ sub command_for_me ($$$$$$) {
       my $count = $present ? @{$present} : 0;
 
       unless ($present && $count) {
-	  Say( $self, $dest_nick, "I don't who is present, $from_nick", 1);
+	  Say( $self, $dest_nick, "I don't know who is present, $from_nick", 1);
 	  return;
       }
 
@@ -2940,7 +2940,7 @@ sub watch_significant_events ($$$$$$) {
 	else {
 	    Say( $self,
 		 $dest_nick,
-		 'questions must be reference by number',
+		 'questions must be referenced by number',
 		 $addressed
 	       );
 	    return 1;
